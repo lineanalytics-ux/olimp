@@ -7,8 +7,12 @@ const axios = require('axios');
 puppeteer.use(StealthPlugin());
 
 const app = express();
-app.use(express.json());
 
+// Поддержка JSON и URL-encoded данных
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// In-Memory кэш сессий
 const sessionCache = {};
 
 function parseKef(value) {
@@ -99,7 +103,7 @@ async function performPuppeteerAuth(domain, login, password) {
 
     await browser.close();
 
-    if (!isSuccess) throw new Error('Авторизация не удалась');
+    if (!isSuccess) throw new Error('Авторизация не удалась (ussid не получен)');
 
     return {
       success: true,
@@ -113,21 +117,15 @@ async function performPuppeteerAuth(domain, login, password) {
   }
 }
 
-/**
- * Точный вызов корзины по структуре curl-запроса
- */
 async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
   const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
 
-  // Формируем составной ID исхода точно как в curl: originalId:basketId
-  // Если basketId содержит доп. дефисы или параметры, используем полную цепочку
   let fullBasketId = outcome.basketId;
   if (!fullBasketId.includes(':')) {
     fullBasketId = `${outcome.originalId}:${outcome.basketId}`;
   }
 
-  // Извлекаем чистый matchId (например, 86173165 из basketId)
   const matchParam = outcome.basketId.split(':')[0] || matchId;
 
   const headers = {
@@ -148,10 +146,8 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   };
 
   try {
-    // 1. Очистка корзины
     await axios.post(clearUrl, 'action=clearbasket&currpage=line', { headers }).catch(() => {});
 
-    // 2. Добавление коэффицента в форматеcurl
     const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${outcome.probability}&id=${encodeURIComponent(fullBasketId)}&v1=${outcome.probability}&v2=1&v3=1&match=${matchParam}`;
 
     const response = await axios.post(addUrl, payload, { headers });
@@ -162,7 +158,6 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
     const keys = Object.keys(betslip);
     if (keys.length === 0) return null;
 
-    // Возвращаем объект добавленного ставки
     return betslip[keys[0]];
   } catch (e) {
     console.log(`[Basket Exception] ${e.message}`);
@@ -171,15 +166,78 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
 }
 
 // ---------------------------------------------------------------------
-// ЭНДПОИНТ /getmaxinfo
+// МАРШРУТЫ И ЭНДПОИНТЫ API
 // ---------------------------------------------------------------------
-app.all('/getmaxinfo', async (req, res) => {
-  const login = req.body?.login || req.query?.login || '77088167661';
-  const password = req.body?.password || req.query?.password || 'Almaty2026';
-  let domain = req.body?.domain || req.query?.domain || '0limpbk-0nline.com';
+
+// Главная страница
+app.get('/', (req, res) => {
+  res.send('Auth & Basket Service is Live');
+});
+
+// Единый обработчик для /auth (поддерживает GET и POST)
+const handleAuth = async (req, res) => {
+  const login = req.query?.login || req.body?.login;
+  const password = req.query?.password || req.body?.password;
+
+  let domain = req.query?.domain || req.body?.domain || '0limpbk-0nline.com';
   domain = domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
 
-  const outcomes = req.body?.outcomes || req.query?.outcomes;
+  if (!login || !password) {
+    return res.status(400).json({ error: 'Параметры login и password обязательны' });
+  }
+
+  const cacheKey = `${domain}_${login}`;
+  const forceRefresh = req.query?.force === 'true' || req.body?.force === 'true';
+
+  try {
+    if (!forceRefresh && sessionCache[cacheKey]) {
+      const cachedSession = sessionCache[cacheKey];
+      const valid = await isSessionValid(domain, cachedSession.cookie_string);
+      if (valid) {
+        return res.json({
+          from_cache: true,
+          domain: domain,
+          ...cachedSession
+        });
+      }
+    }
+
+    const authResult = await performPuppeteerAuth(domain, login, password);
+
+    sessionCache[cacheKey] = {
+      success: authResult.success,
+      ussid: authResult.ussid,
+      cookies: authResult.cookies,
+      cookie_string: authResult.cookie_string,
+      updatedAt: new Date().toISOString()
+    };
+
+    return res.json({
+      from_cache: false,
+      domain: domain,
+      ...sessionCache[cacheKey]
+    });
+
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      domain: domain,
+      error: err.message
+    });
+  }
+};
+
+app.get('/auth', handleAuth);
+app.post('/auth', handleAuth);
+
+// Обработчик /getmaxinfo (поддерживает GET и POST)
+const handleGetMaxInfo = async (req, res) => {
+  const login = req.query?.login || req.body?.login || '77088167661';
+  const password = req.query?.password || req.body?.password || 'Almaty2026';
+  let domain = req.query?.domain || req.body?.domain || '0limpbk-0nline.com';
+  domain = domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
+
+  const outcomes = req.body?.outcomes || (req.query?.outcomes ? JSON.parse(req.query.outcomes) : null);
   const matchId = req.body?.matchId || req.query?.matchId;
 
   if (!outcomes || !Array.isArray(outcomes) || outcomes.length < 2 || !matchId) {
@@ -250,9 +308,15 @@ app.all('/getmaxinfo', async (req, res) => {
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
-});
+};
 
-app.get('/', (req, res) => res.send('Auth & Basket Service Live'));
+app.get('/getmaxinfo', handleGetMaxInfo);
+app.post('/getmaxinfo', handleGetMaxInfo);
+
+// Обработчик несуществующих маршрутов
+app.use((req, res) => {
+  res.status(404).json({ error: `Route ${req.method} ${req.url} not found` });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
