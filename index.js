@@ -2,21 +2,44 @@ const express = require('express');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const chromium = require('@sparticuz/chromium');
+const axios = require('axios'); // Используется для быстрой проверки живых кук
 
 puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
 
-app.all('/auth', async (req, res) => {
-  const login = req.body?.login || req.query?.login;
-  const password = req.body?.password || req.query?.password;
+// In-Memory кэш сессий для разных доменов и логинов
+// Структура: cacheStore[cacheKey] = { cookiesObj, cookieString, ussid, updatedAt }
+const sessionCache = {};
 
-  if (!login || !password) {
-    return res.status(400).json({ error: 'Параметры login и password обязательны' });
+// Функция быстрой проверки валидности сессии (без запуска Puppeteer)
+async function isSessionValid(domain, cookieString) {
+  try {
+    const response = await axios.get(`https://${domain}/`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0',
+        'Cookie': cookieString
+      },
+      maxRedirects: 0,
+      timeout: 5000,
+      validateStatus: (status) => status >= 200 && status < 400
+    });
+
+    // Проверяем заголовки ответа — если сервер не пытается сбросить ussid
+    const setCookie = response.headers['set-cookie'] || [];
+    const isDeleted = setCookie.some(header => header.includes('ussid=deleted'));
+
+    return !isDeleted;
+  } catch (err) {
+    return false;
   }
+}
 
+// Функция прохождения авторизации через Puppeteer
+async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
+  const targetUrl = `https://${domain}/`;
 
   try {
     const executablePath = await chromium.executablePath();
@@ -39,7 +62,7 @@ app.all('/auth', async (req, res) => {
 
     const page = await browser.newPage();
 
-    // Блокируем загрузку картинок, медиа и шрифтов для ускорения в 3-5 раз
+    // Блокировка тяжелых ресурсов
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const resourceType = req.resourceType();
@@ -52,29 +75,27 @@ app.all('/auth', async (req, res) => {
 
     await page.setViewport({ width: 1366, height: 768 });
 
-    // 1. Быстрый переход на страницу без ожидания всех асинхронных запросов
-    await page.goto('https://0limpbk-0nline.com/', {
+    // 1. Загрузка страницы
+    await page.goto(targetUrl, {
       waitUntil: 'domcontentloaded',
       timeout: 30000
     });
 
-    // Ожидаем появление хотя бы одной формы/поля ввода
     await page.waitForSelector('input[name="login"]', { timeout: 15000 });
 
-    // 2. Вводим логин и пароль
+    // 2. Ввод данных
     await page.type('input[name="login"]', login, { delay: 20 });
     await page.type('input[name="passw"]', password, { delay: 20 });
 
-    // 3. Отправляем форму
+    // 3. Отправка формы
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
       page.keyboard.press('Enter')
     ]);
 
-    // Небольшая пауза для простановки Set-Cookie
     await new Promise(r => setTimeout(r, 2000));
 
-    // 4. Сбор кук
+    // 4. Забор кук
     const rawCookies = await page.cookies();
     const cookiesObj = {};
     rawCookies.forEach(c => { cookiesObj[c.name] = c.value; });
@@ -84,18 +105,87 @@ app.all('/auth', async (req, res) => {
 
     await browser.close();
 
-    return res.json({
-      success: isSuccess,
-      ussid: cookiesObj['ussid'] || null,
+    if (!isSuccess) {
+      throw new Error('Авторизация не удалась (ussid не получен)');
+    }
+
+    return {
+      success: true,
+      ussid: cookiesObj['ussid'],
       cookies: cookiesObj,
       cookie_string: cookieString
-    });
+    };
 
   } catch (err) {
     if (browser) await browser.close();
-    return res.status(500).json({ success: false, error: err.message });
+    throw err;
+  }
+}
+
+// Эндпоинт получения кук
+app.all('/auth', async (req, res) => {
+  const login = req.body?.login || req.query?.login;
+  const password = req.body?.password || req.query?.password;
+
+  // Динамический домен (по умолчанию: 0limpbk-0nline.com)
+  let domain = req.body?.domain || req.query?.domain || '0limpbk-0nline.com';
+  
+  // Очистка доменного имени от https:// и слешей, если передали полный URL
+  domain = domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
+
+  if (!login || !password) {
+    return res.status(400).json({ error: 'Параметры login и password обязательны' });
+  }
+
+  const cacheKey = `${domain}_${login}`;
+  const forceRefresh = req.body?.force === 'true' || req.query?.force === 'true';
+
+  try {
+    // ПРОВЕРКА КЭША: Если FORCE не передан и в кэше есть куки
+    if (!forceRefresh && sessionCache[cacheKey]) {
+      const cachedSession = sessionCache[cacheKey];
+      
+      // Проверяем жива ли сессия быстрой HTTP-проверкой
+      const valid = await isSessionValid(domain, cachedSession.cookie_string);
+      
+      if (valid) {
+        return res.json({
+          from_cache: true,
+          domain: domain,
+          ...cachedSession
+        });
+      }
+    }
+
+    // ЕСЛИ КЭША НЕТ ИЛИ СЕССИЯ СЛЕТЕЛА: Запускаем авторизацию
+    const authResult = await performPuppeteerAuth(domain, login, password);
+
+    // Сохраняем свежие куки в кэш
+    sessionCache[cacheKey] = {
+      success: authResult.success,
+      ussid: authResult.ussid,
+      cookies: authResult.cookies,
+      cookie_string: authResult.cookie_string,
+      updatedAt: new Date().toISOString()
+    };
+
+    return res.json({
+      from_cache: false,
+      domain: domain,
+      ...sessionCache[cacheKey]
+    });
+
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      domain: domain,
+      error: err.message
+    });
   }
 });
+
+// Доп. зависимости (axios)
+// Не забудьте убедиться, что axios прописан в package.json
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
