@@ -22,7 +22,15 @@ app.all('/auth', async (req, res) => {
     const executablePath = await chromium.executablePath();
 
     browser = await puppeteer.launch({
-      args: chromium.args,
+      args: [
+        ...chromium.args,
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--single-process'
+      ],
       defaultViewport: chromium.defaultViewport,
       executablePath: executablePath,
       headless: chromium.headless,
@@ -30,21 +38,43 @@ app.all('/auth', async (req, res) => {
     });
 
     const page = await browser.newPage();
-    await page.setViewport({ width: 1366, height: 768 });
 
-    await page.goto('https://0limpbk-0nline.com/', {
-      waitUntil: 'networkidle2',
-      timeout: 60000
+    // Блокируем загрузку картинок, медиа и шрифтов для ускорения в 3-5 раз
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const resourceType = req.resourceType();
+      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
     });
 
-    await page.type('input[name="login"]', login, { delay: 50 });
-    await page.type('input[name="passw"]', password, { delay: 50 });
+    await page.setViewport({ width: 1366, height: 768 });
 
+    // 1. Быстрый переход на страницу без ожидания всех асинхронных запросов
+    await page.goto('https://0limpbk-0nline.com/', {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
+    });
+
+    // Ожидаем появление хотя бы одной формы/поля ввода
+    await page.waitForSelector('input[name="login"]', { timeout: 15000 });
+
+    // 2. Вводим логин и пароль
+    await page.type('input[name="login"]', login, { delay: 20 });
+    await page.type('input[name="passw"]', password, { delay: 20 });
+
+    // 3. Отправляем форму
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {}),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
       page.keyboard.press('Enter')
     ]);
 
+    // Небольшая пауза для простановки Set-Cookie
+    await new Promise(r => setTimeout(r, 2000));
+
+    // 4. Сбор кук
     const rawCookies = await page.cookies();
     const cookiesObj = {};
     rawCookies.forEach(c => { cookiesObj[c.name] = c.value; });
