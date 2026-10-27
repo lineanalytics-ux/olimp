@@ -183,7 +183,92 @@ app.all('/auth', async (req, res) => {
     });
   }
 });
+// Эндпоинт добавления исхода в корзину и получения new_max_bet
+app.all('/basket', async (req, res) => {
+  const login = req.body?.login || req.query?.login || '77088167661';
+  const password = req.body?.password || req.query?.password || 'Almaty2026';
+  let domain = req.body?.domain || req.query?.domain || '0limpbk-0nline.com';
+  domain = domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
 
+  const probability = req.body?.probability || req.query?.probability;
+  const id = req.body?.id || req.query?.id;
+  const match = req.body?.match || req.query?.match;
+
+  if (!probability || !id || !match) {
+    return res.status(400).json({ error: 'Параметры probability, id и match обязательны' });
+  }
+
+  const cacheKey = `${domain}_${login}`;
+
+  try {
+    // 1. Получаем живые куки (из кэша или через Puppeteer)
+    let session = sessionCache[cacheKey];
+    if (!session || !(await isSessionValid(domain, session.cookie_string))) {
+      const authResult = await performPuppeteerAuth(domain, login, password);
+      sessionCache[cacheKey] = {
+        success: authResult.success,
+        ussid: authResult.ussid,
+        cookies: authResult.cookies,
+        cookie_string: authResult.cookie_string,
+        updatedAt: new Date().toISOString()
+      };
+      session = sessionCache[cacheKey];
+    }
+
+    // 2. Сначала очищаем корзину
+    const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
+    await axios.post(clearUrl, 'action=clearbasket&currpage=line', {
+      headers: {
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Cookie': session.cookie_string,
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': `https://${domain}/`,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0'
+      }
+    });
+
+    // 3. Отправляем запрос на добавление коэффициента
+    const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
+    const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${probability}&id=${id}:42462&v1=${probability}&v2=1&v3=1&match=${match}`;
+
+    const response = await axios.post(addUrl, payload, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Cookie': session.cookie_string,
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': `https://${domain}/`,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0'
+      }
+    });
+
+    const betslip = response.data?.betslip;
+    const targetFullId = id + ':42462';
+    let targetBet = null;
+
+    if (betslip) {
+      for (let key in betslip) {
+        if (betslip.hasOwnProperty(key)) {
+          const bet = betslip[key];
+          const currentFullId = bet.eventid_added + ':' + bet.market_data;
+          if (bet.market_data && currentFullId === targetFullId) {
+            targetBet = bet;
+            break;
+          }
+        }
+      }
+    }
+
+    return res.json({
+      success: true,
+      bet: targetBet,
+      raw_response: response.data
+    });
+
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
 // Доп. зависимости (axios)
 // Не забудьте убедиться, что axios прописан в package.json
 
