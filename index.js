@@ -121,12 +121,25 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
   const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
 
-  let fullBasketId = outcome.basketId;
-  if (!fullBasketId.includes(':')) {
-    fullBasketId = `${outcome.originalId}:${outcome.basketId}`;
+  // 1. Формирование корректного ID для добавления в корзину
+  let rawBasketId = String(outcome.basketId || '');
+  let originalId = String(outcome.originalId || '');
+
+  let fullId = '';
+  if (rawBasketId.startsWith(originalId)) {
+    fullId = rawBasketId;
+  } else {
+    fullId = `${originalId}:${rawBasketId}`;
   }
 
-  const matchParam = outcome.basketId.split(':')[0] || matchId;
+  // Если в ID меньше 9 элементов через двоеточие, добавляем хвост
+  if ((fullId.match(/:/g) || []).length < 9) {
+    fullId += ':140612801';
+  }
+
+  // Извлекаем matchId для корзины (86173165)
+  const parts = rawBasketId.split(':');
+  const matchParam = parts.length > 1 ? parts[0] : (parts[0] || matchId);
 
   const headers = {
     'accept': 'application/json, text/javascript, */*; q=0.01',
@@ -146,18 +159,24 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   };
 
   try {
+    // 1. Очищаем корзину
     await axios.post(clearUrl, 'action=clearbasket&currpage=line', { headers }).catch(() => {});
 
-    const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${outcome.probability}&id=${encodeURIComponent(fullBasketId)}&v1=${outcome.probability}&v2=1&v3=1&match=${matchParam}`;
+    // 2. Добавляем исход
+    const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${outcome.probability}&id=${encodeURIComponent(fullId)}&v1=${outcome.probability}&v2=1&v3=1&match=${matchParam}`;
 
     const response = await axios.post(addUrl, payload, { headers });
     const betslip = response.data?.betslip;
 
-    if (!betslip) return null;
+    if (!betslip) {
+      console.log('[Basket Fail] Пустой betslip:', JSON.stringify(response.data));
+      return null;
+    }
 
     const keys = Object.keys(betslip);
     if (keys.length === 0) return null;
 
+    // Возвращаем объект добавленного исхода
     return betslip[keys[0]];
   } catch (e) {
     console.log(`[Basket Exception] ${e.message}`);
@@ -231,6 +250,79 @@ app.get('/auth', handleAuth);
 app.post('/auth', handleAuth);
 
 // Обработчик /getmaxinfo (поддерживает GET и POST)
+/**
+ * Функция отправки исхода в корзину (соответствует структурам curl)
+ */
+async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
+  const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
+  const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
+
+  // 1. Формирование корректного ID для добавления в корзину
+  let rawBasketId = String(outcome.basketId || '');
+  let originalId = String(outcome.originalId || '');
+
+  let fullId = '';
+  if (rawBasketId.startsWith(originalId)) {
+    fullId = rawBasketId;
+  } else {
+    fullId = `${originalId}:${rawBasketId}`;
+  }
+
+  // Если в ID меньше 9 элементов через двоеточие, добавляем хвост
+  if ((fullId.match(/:/g) || []).length < 9) {
+    fullId += ':140612801';
+  }
+
+  // Извлекаем matchId для корзины (86173165)
+  const parts = rawBasketId.split(':');
+  const matchParam = parts.length > 1 ? parts[0] : (parts[0] || matchId);
+
+  const headers = {
+    'accept': 'application/json, text/javascript, */*; q=0.01',
+    'accept-language': 'ru,en-US;q=0.9,en;q=0.8',
+    'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    'cookie': cookieString,
+    'origin': `https://${domain}`,
+    'referer': `https://${domain}/betting/index.php?page=line&action=2`,
+    'sec-ch-ua': '"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
+    'x-requested-with': 'XMLHttpRequest'
+  };
+
+  try {
+    // 1. Очищаем корзину
+    await axios.post(clearUrl, 'action=clearbasket&currpage=line', { headers }).catch(() => {});
+
+    // 2. Добавляем исход
+    const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${outcome.probability}&id=${encodeURIComponent(fullId)}&v1=${outcome.probability}&v2=1&v3=1&match=${matchParam}`;
+
+    const response = await axios.post(addUrl, payload, { headers });
+    const betslip = response.data?.betslip;
+
+    if (!betslip) {
+      console.log('[Basket Fail] Пустой betslip:', JSON.stringify(response.data));
+      return null;
+    }
+
+    const keys = Object.keys(betslip);
+    if (keys.length === 0) return null;
+
+    // Возвращаем объект добавленного исхода
+    return betslip[keys[0]];
+  } catch (e) {
+    console.log(`[Basket Exception] ${e.message}`);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------
+// ОБРАБОТЧИК /getmaxinfo
+// ---------------------------------------------------------------------
 const handleGetMaxInfo = async (req, res) => {
   const login = req.query?.login || req.body?.login || '77088167661';
   const password = req.query?.password || req.body?.password || 'Almaty2026';
@@ -249,6 +341,7 @@ const handleGetMaxInfo = async (req, res) => {
   try {
     let session = sessionCache[cacheKey];
     if (!session || !(await isSessionValid(domain, session.cookie_string))) {
+      console.log('[Auth] Запуск авторизации Puppeteer...');
       const authResult = await performPuppeteerAuth(domain, login, password);
       sessionCache[cacheKey] = {
         success: authResult.success,
@@ -262,6 +355,7 @@ const handleGetMaxInfo = async (req, res) => {
 
     const cookieString = session.cookie_string;
 
+    // Последовательно запрашиваем корзину для обох исходов
     const betjson1 = await fetchBetFromBasket(domain, cookieString, outcomes[0], matchId);
     const betjson2 = await fetchBetFromBasket(domain, cookieString, outcomes[1], matchId);
 
@@ -270,6 +364,10 @@ const handleGetMaxInfo = async (req, res) => {
         success: false,
         maxBet: 0,
         maxPay: false,
+        debug: {
+          bet1_ok: Boolean(betjson1),
+          bet2_ok: Boolean(betjson2)
+        },
         error: 'Не удалось получить данные корзины для одного из исходов'
       });
     }
