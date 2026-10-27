@@ -19,7 +19,6 @@ app.all('/auth', async (req, res) => {
   let browser = null;
 
   try {
-    // Получаем путь к Chromium из пакета sparticuz
     const executablePath = await chromium.executablePath();
 
     browser = await puppeteer.launch({
