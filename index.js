@@ -117,29 +117,24 @@ async function performPuppeteerAuth(domain, login, password) {
   }
 }
 
+/**
+ * Функция добавления исхода в корзину (с точным сбором параметров)
+ */
 async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
   const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
 
-  // 1. Формирование корректного ID для добавления в корзину
-  let rawBasketId = String(outcome.basketId || '');
-  let originalId = String(outcome.originalId || '');
+  const originalId = String(outcome.originalId || '').trim();
+  const basketId = String(outcome.basketId || '').trim();
 
-  let fullId = '';
-  if (rawBasketId.startsWith(originalId)) {
-    fullId = rawBasketId;
-  } else {
-    fullId = `${originalId}:${rawBasketId}`;
-  }
-
-  // Если в ID меньше 9 элементов через двоеточие, добавляем хвост
-  if ((fullId.match(/:/g) || []).length < 9) {
+  // 1. Формируем точный составной ID: originalId + ":" + basketId + ":140612801"
+  let fullId = `${originalId}:${basketId}`;
+  if (!fullId.endsWith(':140612801')) {
     fullId += ':140612801';
   }
 
-  // Извлекаем matchId для корзины (86173165)
-  const parts = rawBasketId.split(':');
-  const matchParam = parts.length > 1 ? parts[0] : (parts[0] || matchId);
+  // 2. Достаем параметр match (первое число из basketId, например "86173165")
+  const matchParam = basketId.split(':')[0] || matchId;
 
   const headers = {
     'accept': 'application/json, text/javascript, */*; q=0.01',
@@ -159,24 +154,28 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   };
 
   try {
-    // 1. Очищаем корзину
+    // Шаг 1. Очищаем корзину
     await axios.post(clearUrl, 'action=clearbasket&currpage=line', { headers }).catch(() => {});
 
-    // 2. Добавляем исход
-    const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${outcome.probability}&id=${encodeURIComponent(fullId)}&v1=${outcome.probability}&v2=1&v3=1&match=${matchParam}`;
+    // Шаг 2. Собираем payload с обязательным кодированием id
+    const encodedId = encodeURIComponent(fullId);
+    const prob = outcome.probability;
+    const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${prob}&id=${encodedId}&v1=${prob}&v2=1&v3=1&match=${matchParam}`;
+
+    console.log(`[Basket Req] Payload: ${payload}`);
 
     const response = await axios.post(addUrl, payload, { headers });
     const betslip = response.data?.betslip;
 
     if (!betslip) {
-      console.log('[Basket Fail] Пустой betslip:', JSON.stringify(response.data));
+      console.log(`[Basket Fail] Поле betslip не получено. Ответ: ${JSON.stringify(response.data)}`);
       return null;
     }
 
     const keys = Object.keys(betslip);
     if (keys.length === 0) return null;
 
-    // Возвращаем объект добавленного исхода
+    // Возвращаем первую добавленную ставку
     return betslip[keys[0]];
   } catch (e) {
     console.log(`[Basket Exception] ${e.message}`);
