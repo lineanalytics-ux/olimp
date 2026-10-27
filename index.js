@@ -2,18 +2,32 @@ const express = require('express');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const chromium = require('@sparticuz/chromium');
-const axios = require('axios'); // Используется для быстрой проверки живых кук
+const axios = require('axios');
 
 puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
 
-// In-Memory кэш сессий для разных доменов и логинов
-// Структура: cacheStore[cacheKey] = { cookiesObj, cookieString, ussid, updatedAt }
+// In-Memory кэш сессий: sessionCache[cacheKey] = { cookiesObj, cookie_string, ussid, updatedAt }
 const sessionCache = {};
 
-// Функция быстрой проверки валидности сессии (без запуска Puppeteer)
+/**
+ * Вспомогательная функция очистки значения коэффициента (аналог kAsFloat)
+ */
+function parseKef(value) {
+  if (typeof value === 'string') {
+    value = value.replace(/<[^>]*>/g, '')
+                 .replace(/&nbsp;/g, '')
+                 .replace(/\s+/g, '')
+                 .replace(',', '.');
+  }
+  return parseFloat(value) || 0;
+}
+
+/**
+ * Быстрая проверка валидности сессии (без запуска Puppeteer)
+ */
 async function isSessionValid(domain, cookieString) {
   try {
     const response = await axios.get(`https://${domain}/`, {
@@ -26,7 +40,6 @@ async function isSessionValid(domain, cookieString) {
       validateStatus: (status) => status >= 200 && status < 400
     });
 
-    // Проверяем заголовки ответа — если сервер не пытается сбросить ussid
     const setCookie = response.headers['set-cookie'] || [];
     const isDeleted = setCookie.some(header => header.includes('ussid=deleted'));
 
@@ -36,7 +49,9 @@ async function isSessionValid(domain, cookieString) {
   }
 }
 
-// Функция прохождения авторизации через Puppeteer
+/**
+ * Авторизация через Puppeteer (с прохождением JS-челленджа)
+ */
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
@@ -62,7 +77,7 @@ async function performPuppeteerAuth(domain, login, password) {
 
     const page = await browser.newPage();
 
-    // Блокировка тяжелых ресурсов
+    // Отключаем загрузку тяжелых ресурсов
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const resourceType = req.resourceType();
@@ -75,7 +90,7 @@ async function performPuppeteerAuth(domain, login, password) {
 
     await page.setViewport({ width: 1366, height: 768 });
 
-    // 1. Загрузка страницы
+    // 1. Переход на страницу
     await page.goto(targetUrl, {
       waitUntil: 'domcontentloaded',
       timeout: 30000
@@ -122,15 +137,60 @@ async function performPuppeteerAuth(domain, login, password) {
   }
 }
 
-// Эндпоинт получения кук
+/**
+ * Вспомогательная функция работы с корзиной сайта
+ */
+async function fetchBetFromBasket(domain, cookieString, probability, id, match) {
+  const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
+  const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
+  const targetFullId = id + ':42462';
+
+  const headers = {
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'Cookie': cookieString,
+    'X-Requested-With': 'XMLHttpRequest',
+    'Referer': `https://${domain}/`,
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0'
+  };
+
+  // 1. Очистка корзины
+  await axios.post(clearUrl, 'action=clearbasket&currpage=line', { headers }).catch(() => {});
+
+  // 2. Добавление коэффицента в корзину
+  const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${probability}&id=${id}:42462&v1=${probability}&v2=1&v3=1&match=${match}`;
+  const response = await axios.post(addUrl, payload, { headers });
+
+  const betslip = response.data?.betslip;
+  if (betslip) {
+    for (let key in betslip) {
+      if (betslip.hasOwnProperty(key)) {
+        const bet = betslip[key];
+        const currentFullId = bet.eventid_added + ':' + bet.market_data;
+        if (bet.market_data && currentFullId === targetFullId) {
+          return bet;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------
+// ЭНДПОИНТЫ API
+// ---------------------------------------------------------------------
+
+// Главная страница (для пинга / health-check)
+app.get('/', (req, res) => {
+  res.send('Auth & Basket Service is Live');
+});
+
+// 1. Получение кук авторизации
 app.all('/auth', async (req, res) => {
   const login = req.body?.login || req.query?.login;
   const password = req.body?.password || req.query?.password;
 
-  // Динамический домен (по умолчанию: 0limpbk-0nline.com)
   let domain = req.body?.domain || req.query?.domain || '0limpbk-0nline.com';
-  
-  // Очистка доменного имени от https:// и слешей, если передали полный URL
   domain = domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
 
   if (!login || !password) {
@@ -141,13 +201,9 @@ app.all('/auth', async (req, res) => {
   const forceRefresh = req.body?.force === 'true' || req.query?.force === 'true';
 
   try {
-    // ПРОВЕРКА КЭША: Если FORCE не передан и в кэше есть куки
     if (!forceRefresh && sessionCache[cacheKey]) {
       const cachedSession = sessionCache[cacheKey];
-      
-      // Проверяем жива ли сессия быстрой HTTP-проверкой
       const valid = await isSessionValid(domain, cachedSession.cookie_string);
-      
       if (valid) {
         return res.json({
           from_cache: true,
@@ -157,10 +213,8 @@ app.all('/auth', async (req, res) => {
       }
     }
 
-    // ЕСЛИ КЭША НЕТ ИЛИ СЕССИЯ СЛЕТЕЛА: Запускаем авторизацию
     const authResult = await performPuppeteerAuth(domain, login, password);
 
-    // Сохраняем свежие куки в кэш
     sessionCache[cacheKey] = {
       success: authResult.success,
       ussid: authResult.ussid,
@@ -183,25 +237,24 @@ app.all('/auth', async (req, res) => {
     });
   }
 });
-// Эндпоинт добавления исхода в корзину и получения new_max_bet
-app.all('/basket', async (req, res) => {
+
+// 2. Вычисление getmaxinfo для события
+app.all('/getmaxinfo', async (req, res) => {
   const login = req.body?.login || req.query?.login || '77088167661';
   const password = req.body?.password || req.query?.password || 'Almaty2026';
   let domain = req.body?.domain || req.query?.domain || '0limpbk-0nline.com';
   domain = domain.replace(/^https?:\/\//, '').replace(/\/.*$/, '').trim();
 
-  const probability = req.body?.probability || req.query?.probability;
-  const id = req.body?.id || req.query?.id;
-  const match = req.body?.match || req.query?.match;
+  const outcomes = req.body?.outcomes || req.query?.outcomes;
+  const matchId = req.body?.matchId || req.query?.matchId;
 
-  if (!probability || !id || !match) {
-    return res.status(400).json({ error: 'Параметры probability, id и match обязательны' });
+  if (!outcomes || !Array.isArray(outcomes) || outcomes.length < 2 || !matchId) {
+    return res.status(400).json({ error: 'Требуется массив outcomes (минимум 2 исхода) и matchId' });
   }
 
   const cacheKey = `${domain}_${login}`;
 
   try {
-    // 1. Получаем живые куки (из кэша или через Puppeteer)
     let session = sessionCache[cacheKey];
     if (!session || !(await isSessionValid(domain, session.cookie_string))) {
       const authResult = await performPuppeteerAuth(domain, login, password);
@@ -215,62 +268,61 @@ app.all('/basket', async (req, res) => {
       session = sessionCache[cacheKey];
     }
 
-    // 2. Сначала очищаем корзину
-    const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
-    await axios.post(clearUrl, 'action=clearbasket&currpage=line', {
-      headers: {
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Cookie': session.cookie_string,
-        'X-Requested-With': 'XMLHttpRequest',
-        'Referer': `https://${domain}/`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0'
-      }
-    });
+    const cookieString = session.cookie_string;
 
-    // 3. Отправляем запрос на добавление коэффициента
-    const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
-    const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${probability}&id=${id}:42462&v1=${probability}&v2=1&v3=1&match=${match}`;
+    const id1 = `${outcomes[0].originalId}:${outcomes[0].basketId}`;
+    const id2 = `${outcomes[1].originalId}:${outcomes[1].basketId}`;
 
-    const response = await axios.post(addUrl, payload, {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Cookie': session.cookie_string,
-        'X-Requested-With': 'XMLHttpRequest',
-        'Referer': `https://${domain}/`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0'
-      }
-    });
+    const betjson1 = await fetchBetFromBasket(domain, cookieString, outcomes[0].probability, id1, matchId);
+    const betjson2 = await fetchBetFromBasket(domain, cookieString, outcomes[1].probability, id2, matchId);
 
-    const betslip = response.data?.betslip;
-    const targetFullId = id + ':42462';
-    let targetBet = null;
+    if (!betjson1 || !betjson2) {
+      return res.json({
+        success: false,
+        maxBet: 0,
+        maxPay: false,
+        error: 'Не удалось получить данные корзины для одного из исходов'
+      });
+    }
 
-    if (betslip) {
-      for (let key in betslip) {
-        if (betslip.hasOwnProperty(key)) {
-          const bet = betslip[key];
-          const currentFullId = bet.eventid_added + ':' + bet.market_data;
-          if (bet.market_data && currentFullId === targetFullId) {
-            targetBet = bet;
-            break;
-          }
-        }
+    const bet1 = parseFloat(betjson1.new_max_bet) || 0;
+    const bet2 = parseFloat(betjson2.new_max_bet) || 0;
+    const k1 = parseKef(betjson1.value);
+    const k2 = parseKef(betjson2.value);
+
+    let result = {
+      maxBet: 0,
+      maxPay: false
+    };
+
+    if (bet1 === bet2) {
+      result.maxBet = bet1;
+      result.maxPay = false;
+    } else {
+      const calc1 = bet1 * (k1 - 1);
+      const calc2 = bet2 * (k2 - 1);
+      const max_diff = Math.abs(calc1 - calc2);
+
+      if (max_diff < 1000) {
+        result.maxBet = calc1;
+        result.maxPay = true;
       }
     }
 
     return res.json({
       success: true,
-      bet: targetBet,
-      raw_response: response.data
+      maxBet: result.maxBet,
+      maxPay: result.maxPay,
+      bet1: bet1,
+      bet2: bet2,
+      k1: k1,
+      k2: k2
     });
 
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
-// Доп. зависимости (axios)
-// Не забудьте убедиться, что axios прописан в package.json
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
