@@ -57,14 +57,12 @@ async function isSessionValid(domain, cookieString) {
 }
 
 /**
- * Надежная авторизация через Puppeteer
- */
-/**
- * Надежная авторизация через Puppeteer с прямым вызовом submit()
+ * Прямая отправка формы через Puppeteer بدون ожидания селекторов DOM
  */
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
+  const loginUrl = `https://${domain}/index.php`;
 
   try {
     const executablePath = await chromium.executablePath();
@@ -87,48 +85,58 @@ async function performPuppeteerAuth(domain, login, password) {
 
     const page = await browser.newPage();
 
-    // Задаем реальный User-Agent
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36');
+    // Задаем реальный User-Agent Chrome
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-    // Блокировка только тяжелых медиафайлов (оставляем скрипты и стили)
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const resourceType = req.resourceType();
-      if (['image', 'font', 'media'].includes(resourceType)) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
-
-    await page.setViewport({ width: 1366, height: 768 });
-
-    // 1. Загрузка страницы
+    // 1. Переходим на главную страницу, чтобы прошел защитный челлендж и проставился PHPSESSID
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-    // 2. Ждем появления формы авторизации
-    await page.waitForSelector('input[name="login"]', { timeout: 15000 });
+    // Парсим текущий PHPSESSID и asid со страницы
+    const cookiesBefore = await page.cookies();
+    const phpsessidCookie = cookiesBefore.find(c => c.name === 'PHPSESSID');
+    const phpsessid = phpsessidCookie ? phpsessidCookie.value : '';
 
-    // 3. Ввод данных
-    await page.type('input[name="login"]', login, { delay: 20 });
-    await page.type('input[name="passw"]', password, { delay: 20 });
+    // Извлекаем asid из HTML
+    const pageHtml = await page.content();
+    let asid = null;
+    const matchAsid = pageHtml.match(/name=["']asid["']\s+value=["']([^"']+)["']/i) ||
+                      pageHtml.match(/asid\s*=\s*['"]?(\d+)['"]?/i);
+    if (matchAsid && matchAsid[1]) {
+      asid = matchAsid[1];
+    } else {
+      asid = Math.floor(Math.random() * 10000000).toString();
+    }
 
-    // 4. Отправка формы напрямую через JS страницы
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
-      page.evaluate(() => {
-        const loginInput = document.querySelector('input[name="login"]');
-        if (loginInput) {
-          const form = loginInput.closest('form');
-          if (form) form.submit();
-        }
-      })
-    ]);
+    // 2. Выполняем POST-запрос авторизации напрямую из браузерного контекста
+    await page.evaluate(async (url, loginVal, passVal, asidVal, psidVal) => {
+      const form = document.createElement('form');
+      form.method = 'POST';
+      form.action = url;
 
-    // Пауза 3 секунды для простановки кук
+      const fields = {
+        'login': loginVal,
+        'passw': passVal,
+        'asid': asidVal,
+        'psid': psidVal
+      };
+
+      for (const name in fields) {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = name;
+        input.value = fields[name];
+        form.appendChild(input);
+      }
+
+      document.body.appendChild(form);
+      form.submit();
+    }, loginUrl, login, password, asid, phpsessid);
+
+    // Ждем завершения редиректа после сабмита
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
     await new Promise(r => setTimeout(r, 3000));
 
-    // 5. Забор кук
+    // 3. Собираем куки
     const rawCookies = await page.cookies();
     const cookiesObj = {};
     rawCookies.forEach(c => { cookiesObj[c.name] = c.value; });
@@ -139,7 +147,6 @@ async function performPuppeteerAuth(domain, login, password) {
     await browser.close();
 
     if (!isSuccess) {
-      console.log('[Auth Debug] Полученные куки:', JSON.stringify(cookiesObj));
       throw new Error('Авторизация не удалась (ussid не получен)');
     }
 
