@@ -2,18 +2,21 @@ const express = require('express');
 const puppeteer = require('puppeteer');
 const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// SOCKS5 Прокси
+// Настройки SOCKS5 Прокси
 const PROXY_HOST = process.env.PROXY_HOST || '194.67.199.219';
 const PROXY_PORT = process.env.PROXY_PORT || '33129';
 const PROXY_USER = process.env.PROXY_USER || 'security';
 const PROXY_PASS = process.env.PROXY_PASS || 'xLKmvUg7652eTPVIs7nr';
 
+// SOCKS5 Агент для Axios
 const socksAgent = new SocksProxyAgent(`socks5://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`);
 
 const sessionCache = {};
@@ -28,6 +31,9 @@ function parseKef(value) {
   return parseFloat(value) || 0;
 }
 
+/**
+ * Валидация сессии из кэша через API корзины
+ */
 async function isSessionValid(domain, cookieString) {
   if (!cookieString || !cookieString.includes('ussid=')) {
     return false;
@@ -57,6 +63,9 @@ async function isSessionValid(domain, cookieString) {
   }
 }
 
+/**
+ * Авторизация через Puppeteer (Firefox) с обработкой Client Challenge и SOCKS5
+ */
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
@@ -73,7 +82,38 @@ async function performPuppeteerAuth(domain, login, password) {
     log(`[Auth Start] Запуск Firefox авторизации для домена: ${domain}`);
     log(`[Auth Proxy] Настройка SOCKS5 в Firefox для ${PROXY_HOST}:${PROXY_PORT}`);
 
-    browser = await puppeteer.launch({
+    // Автоматический поиск скачанного бинарника Firefox
+    let firefoxPath;
+    try {
+      firefoxPath = puppeteer.executablePath('firefox');
+    } catch (e) {
+      log(`[Auth Exec] Ручной поиск бинарника в ./cache...`);
+    }
+
+    if (!firefoxPath || !fs.existsSync(firefoxPath)) {
+      const cacheDir = path.join(__dirname, 'cache');
+      if (fs.existsSync(cacheDir)) {
+        const findExec = (dir) => {
+          const files = fs.readdirSync(dir);
+          for (const file of files) {
+            const fullPath = path.join(dir, file);
+            const stat = fs.statSync(fullPath);
+            if (stat.isDirectory()) {
+              const res = findExec(fullPath);
+              if (res) return res;
+            } else if (file === 'firefox' || file === 'firefox.exe') {
+              return fullPath;
+            }
+          }
+          return null;
+        };
+        firefoxPath = findExec(cacheDir);
+      }
+    }
+
+    log(`[Auth Exec] Найден бинарник Firefox: ${firefoxPath || 'авто-определение'}`);
+
+    const launchOptions = {
       browser: 'firefox',
       extraPrefsFirefox: {
         'network.proxy.type': 1,
@@ -89,7 +129,13 @@ async function performPuppeteerAuth(domain, login, password) {
         '--disable-setuid-sandbox'
       ],
       headless: true
-    });
+    };
+
+    if (firefoxPath) {
+      launchOptions.executablePath = firefoxPath;
+    }
+
+    browser = await puppeteer.launch(launchOptions);
 
     log(`[Auth Browser] Firefox запущен. Открываем новую страницу...`);
     const page = await browser.newPage();
@@ -102,7 +148,7 @@ async function performPuppeteerAuth(domain, login, password) {
     let currentTitle = await page.title();
     log(`[Auth Step 1.2] Title: "${currentTitle}"`);
 
-    // --- ОБРАБОТКА WAF / CLIENT CHALLENGE ---
+    // ОБРАБОТКА WAF / CLIENT CHALLENGE
     let retries = 0;
     while (retries < 10) {
       if (!currentTitle.includes('403') && 
@@ -181,6 +227,9 @@ async function performPuppeteerAuth(domain, login, password) {
   }
 }
 
+/**
+ * Получение ставок из корзины (через SOCKS5)
+ */
 async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
   const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
@@ -235,6 +284,10 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
     return null;
   }
 }
+
+// ---------------------------------------------------------------------
+// МАРШРУТЫ И ЭНДПОИНТЫ API
+// ---------------------------------------------------------------------
 
 app.get('/', (req, res) => {
   res.send('Auth & Basket Service (Firefox) is Live');
