@@ -1,16 +1,14 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
+const { firefox } = require('playwright');
 const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
-const path = require('path');
-const fs = require('fs');
 
 const app = express();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Настройки SOCKS5 Прокси
+// SOCKS5 Прокси
 const PROXY_HOST = process.env.PROXY_HOST || '194.67.199.219';
 const PROXY_PORT = process.env.PROXY_PORT || '33129';
 const PROXY_USER = process.env.PROXY_USER || 'security';
@@ -64,9 +62,9 @@ async function isSessionValid(domain, cookieString) {
 }
 
 /**
- * Авторизация через Puppeteer (Firefox) с SOCKS5 и чистым Headless
+ * Авторизация через Playwright (Firefox) + SOCKS5
  */
-async function performPuppeteerAuth(domain, login, password) {
+async function performPlaywrightAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
   const debugLogs = [];
@@ -79,67 +77,25 @@ async function performPuppeteerAuth(domain, login, password) {
   };
 
   try {
-    log(`[Auth Start] Запуск Firefox авторизации для домена: ${domain}`);
-    log(`[Auth Proxy] Настройка SOCKS5 в Firefox для ${PROXY_HOST}:${PROXY_PORT}`);
+    log(`[Auth Start] Запуск Playwright Firefox для домена: ${domain}`);
+    log(`[Auth Proxy] Настройка SOCKS5: ${PROXY_HOST}:${PROXY_PORT}`);
 
-    // Автоматический поиск скачанного бинарника Firefox
-    let firefoxPath;
-    try {
-      firefoxPath = puppeteer.executablePath('firefox');
-    } catch (e) {
-      log(`[Auth Exec] Ручной поиск бинарника в ./cache...`);
-    }
-
-    if (!firefoxPath || !fs.existsSync(firefoxPath)) {
-      const cacheDir = path.join(__dirname, 'cache');
-      if (fs.existsSync(cacheDir)) {
-        const findExec = (dir) => {
-          const files = fs.readdirSync(dir);
-          for (const file of files) {
-            const fullPath = path.join(dir, file);
-            const stat = fs.statSync(fullPath);
-            if (stat.isDirectory()) {
-              const res = findExec(fullPath);
-              if (res) return res;
-            } else if (file === 'firefox' || file === 'firefox.exe') {
-              return fullPath;
-            }
-          }
-          return null;
-        };
-        firefoxPath = findExec(cacheDir);
-      }
-    }
-
-    log(`[Auth Exec] Найден бинарник Firefox: ${firefoxPath || 'авто-определение'}`);
-
-    const launchOptions = {
-      browser: 'firefox',
+    // Нативный запуск Firefox с идеальной поддержкой SOCKS5
+    browser = await firefox.launch({
       headless: true,
-      extraPrefsFirefox: {
-        'network.proxy.type': 1,
-        'network.proxy.socks': PROXY_HOST,
-        'network.proxy.socks_port': parseInt(PROXY_PORT, 10),
-        'network.proxy.socks_version': 5,
-        'network.proxy.socks_remote_dns': true,
-        'network.proxy.socks_username': PROXY_USER,
-        'network.proxy.socks_password': PROXY_PASS
-      },
-      args: [
-        '--headless',
-        '--no-sandbox',
-        '--disable-setuid-sandbox'
-      ]
-    };
+      proxy: {
+        server: `socks5://${PROXY_HOST}:${PROXY_PORT}`,
+        username: PROXY_USER,
+        password: PROXY_PASS
+      }
+    });
 
-    if (firefoxPath) {
-      launchOptions.executablePath = firefoxPath;
-    }
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
+      viewport: { width: 1366, height: 768 }
+    });
 
-    browser = await puppeteer.launch(launchOptions);
-
-    log(`[Auth Browser] Firefox запущен. Открываем новую страницу...`);
-    const page = await browser.newPage();
+    const page = await context.newPage();
 
     log(`[Auth Step 1] Переход на ${targetUrl}...`);
     const startTime = Date.now();
@@ -158,8 +114,8 @@ async function performPuppeteerAuth(domain, login, password) {
           !currentTitle.includes('Just a moment')) {
         break;
       }
-      log(`[Auth Challenge] Ожидание смены задерживающего экрана WAF (попытка ${retries + 1}, Title: "${currentTitle}")...`);
-      await new Promise(r => setTimeout(r, 2000));
+      log(`[Auth Challenge] Ожидание WAF (попытка ${retries + 1}, Title: "${currentTitle}")...`);
+      await page.waitForTimeout(2000);
       currentTitle = await page.title();
       retries++;
     }
@@ -173,8 +129,8 @@ async function performPuppeteerAuth(domain, login, password) {
     log(`[Auth Step 2.1] Инпут логина найден!`);
 
     log(`[Auth Step 3] Ввод учетных данных...`);
-    await page.type('input[name="login"]', login, { delay: 30 });
-    await page.type('input[name="passw"]', password, { delay: 30 });
+    await page.fill('input[name="login"]', login);
+    await page.fill('input[name="passw"]', password);
 
     log(`[Auth Step 4] Отправка формы...`);
     await Promise.all([
@@ -182,14 +138,14 @@ async function performPuppeteerAuth(domain, login, password) {
       page.keyboard.press('Enter')
     ]);
 
-    await new Promise(r => setTimeout(r, 3000));
+    await page.waitForTimeout(3000);
 
     const finalUrl = page.url();
     const finalTitle = await page.title();
     log(`[Auth Step 5] URL: ${finalUrl} | Title: "${finalTitle}"`);
 
     log(`[Auth Step 6] Чтение куки...`);
-    const rawCookies = await page.cookies();
+    const rawCookies = await context.cookies();
     const cookiesObj = {};
     rawCookies.forEach(c => { cookiesObj[c.name] = c.value; });
 
@@ -291,7 +247,7 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
 // ---------------------------------------------------------------------
 
 app.get('/', (req, res) => {
-  res.send('Auth & Basket Service (Firefox) is Live');
+  res.send('Auth & Basket Service (Playwright Firefox) is Live');
 });
 
 const handleAuth = async (req, res) => {
@@ -321,7 +277,7 @@ const handleAuth = async (req, res) => {
       }
     }
 
-    const authResult = await performPuppeteerAuth(domain, login, password);
+    const authResult = await performPlaywrightAuth(domain, login, password);
 
     if (!authResult.success) {
       return res.status(500).json({
@@ -377,7 +333,7 @@ const handleGetMaxInfo = async (req, res) => {
   try {
     let session = sessionCache[cacheKey];
     if (!session || !(await isSessionValid(domain, session.cookie_string))) {
-      const authResult = await performPuppeteerAuth(domain, login, password);
+      const authResult = await performPlaywrightAuth(domain, login, password);
       if (!authResult.success) {
         return res.json({
           success: false,
