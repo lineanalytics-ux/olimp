@@ -73,77 +73,28 @@ async function performPuppeteerAuth(domain, login, password) {
   };
 
   try {
-    log(`[Auth Start] Запуск авторизации для домена: ${domain}`);
-    
-    log(`[Auth Setup] Настройка Chromium...`);
-    
-    // Предотвращение блокировки файла Chromium
-    chromium.setGraphicsMode = false;
-    const executablePath = await chromium.executablePath();
+    log(`[Auth Start] Запуск Firefox для домена: ${domain}`);
 
-    const proxyUrl = `socks5://${PROXY_HOST}:${PROXY_PORT}`;
-    log(`[Auth Proxy] Подключение к ${proxyUrl}`);
+    // В Firefox SOCKS5 с логином и паролем передается нативно через `--proxy-server`
+    const proxyUrl = `socks5://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`;
 
     browser = await puppeteer.launch({
+      product: 'firefox',
       args: [
-        ...chromium.args,
+        `--proxy-server=${proxyUrl}`,
         '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--single-process',
-        `--proxy-server=${proxyUrl}`
+        '--disable-setuid-sandbox'
       ],
-      defaultViewport: { width: 1366, height: 768 },
-      executablePath: executablePath,
-      headless: chromium.headless,
-      ignoreHTTPSErrors: true,
+      headless: true
     });
 
-    log(`[Auth Browser] Браузер запущен. Открываем вкладку...`);
     const page = await browser.newPage();
 
-    log(`[Auth Proxy Auth] Передача логина и пароля прокси...`);
-    await page.authenticate({
-      username: PROXY_USER,
-      password: PROXY_PASS
-    });
-
-    log(`[Auth Interceptor] Включение перехвата запросов...`);
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const resourceType = req.resourceType();
-      if (['image', 'media', 'font'].includes(resourceType)) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
-
     log(`[Auth Step 1] Переход на ${targetUrl}...`);
-    const startTime = Date.now();
-    
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    log(`[Auth Step 1.1] Страница загружена за ${((Date.now() - startTime) / 1000).toFixed(2)}s`);
 
     let currentTitle = await page.title();
-    log(`[Auth Step 1.2] Title: "${currentTitle}"`);
-
-    let retries = 0;
-    while (retries < 8) {
-      if (!currentTitle.includes('403') && !currentTitle.includes('404') && !currentTitle.includes('Client Challenge')) {
-        break;
-      }
-      log(`[Auth Challenge] Ожидание WAF (попытка ${retries + 1}, Title: "${currentTitle}")...`);
-      await new Promise(r => setTimeout(r, 2000));
-      currentTitle = await page.title();
-      retries++;
-    }
-
-    if (currentTitle.includes('403') || currentTitle.includes('404')) {
-      throw new Error(`Сайт заблокировал IP прокси (Title: "${currentTitle}")`);
-    }
+    log(`[Auth Step 1.1] Title: "${currentTitle}"`);
 
     log(`[Auth Step 2] Ожидание инпута login...`);
     await page.waitForSelector('input[name="login"]', { timeout: 20000 });
@@ -154,17 +105,12 @@ async function performPuppeteerAuth(domain, login, password) {
 
     log(`[Auth Step 4] Отправка формы...`);
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => log(`[Nav Warning] ${e.message}`)),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
       page.keyboard.press('Enter')
     ]);
 
     await new Promise(r => setTimeout(r, 2000));
 
-    const finalUrl = page.url();
-    const finalTitle = await page.title();
-    log(`[Auth Step 5] URL: ${finalUrl} | Title: "${finalTitle}"`);
-
-    log(`[Auth Step 6] Чтение куки...`);
     const rawCookies = await page.cookies();
     const cookiesObj = {};
     rawCookies.forEach(c => { cookiesObj[c.name] = c.value; });
@@ -172,15 +118,12 @@ async function performPuppeteerAuth(domain, login, password) {
     const cookieString = rawCookies.map(c => `${c.name}=${c.value}`).join('; ');
     const ussidVal = cookiesObj['ussid'];
 
-    log(`[Auth Step 6.1] Кук: ${rawCookies.length}. ussid: "${ussidVal || 'НЕ ПОЛУЧЕН'}"`);
-
-    const isSuccess = Boolean(ussidVal && ussidVal !== 'deleted');
+    log(`[Auth Step 5] ussid: "${ussidVal || 'НЕ ПОЛУЧЕН'}"`);
 
     await browser.close();
-    log(`[Auth Finish] Завершено. Статус: ${isSuccess ? 'УСПЕХ' : 'ОШИБКА'}`);
 
-    if (!isSuccess) {
-      throw new Error(`Авторизация не удалась (ussid=${ussidVal || 'null'}). Title: "${finalTitle}"`);
+    if (!ussidVal || ussidVal === 'deleted') {
+      throw new Error(`Авторизация не удалась (ussid=${ussidVal || 'null'})`);
     }
 
     return {
@@ -193,9 +136,7 @@ async function performPuppeteerAuth(domain, login, password) {
 
   } catch (err) {
     log(`[Auth Exception] Ошибка: ${err.message}`);
-    if (browser) {
-      await browser.close().catch(() => {});
-    }
+    if (browser) await browser.close().catch(() => {});
     return {
       success: false,
       error: err.message,
