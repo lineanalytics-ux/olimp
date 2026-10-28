@@ -77,11 +77,10 @@ async function performPuppeteerAuth(domain, login, password) {
   };
 
   try {
-    log(`[Auth Start] Запуск Firefox авторизации для домена: ${domain}`);
-
-    // Firefox нативно поддерживает SOCKS5 прокси с логином и паролем в URL
-    const proxyUrl = `socks5://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`;
     log(`[Auth Proxy] Подключение к SOCKS5: ${PROXY_HOST}:${PROXY_PORT}`);
+
+    // Полная URL-строка для Firefox SOCKS5
+    const proxyUrl = `socks5://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`;
 
     browser = await puppeteer.launch({
       browser: 'firefox',
