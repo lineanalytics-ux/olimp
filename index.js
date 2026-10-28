@@ -1,22 +1,20 @@
 const express = require('express');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const chromium = require('@sparticuz/chromium');
+const puppeteer = require('puppeteer');
 const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
-
-puppeteer.use(StealthPlugin());
 
 const app = express();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// SOCKS5 Прокси
 const PROXY_HOST = process.env.PROXY_HOST || '194.67.199.219';
 const PROXY_PORT = process.env.PROXY_PORT || '33129';
 const PROXY_USER = process.env.PROXY_USER || 'security';
 const PROXY_PASS = process.env.PROXY_PASS || 'xLKmvUg7652eTPVIs7nr';
 
+// SOCKS5 Агент для Axios
 const socksAgent = new SocksProxyAgent(`socks5://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`);
 
 const sessionCache = {};
@@ -31,6 +29,9 @@ function parseKef(value) {
   return parseFloat(value) || 0;
 }
 
+/**
+ * Валидация сессии из кэша через API корзины
+ */
 async function isSessionValid(domain, cookieString) {
   if (!cookieString || !cookieString.includes('ussid=')) {
     return false;
@@ -39,7 +40,7 @@ async function isSessionValid(domain, cookieString) {
   try {
     const response = await axios.get(`https://${domain}/ajax_basket_index.php?_r=${Math.random()}`, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
         'Cookie': cookieString,
         'X-Requested-With': 'XMLHttpRequest'
       },
@@ -60,6 +61,9 @@ async function isSessionValid(domain, cookieString) {
   }
 }
 
+/**
+ * Авторизация через Puppeteer (Firefox) c нативной поддержкой SOCKS5
+ */
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
@@ -73,13 +77,21 @@ async function performPuppeteerAuth(domain, login, password) {
   };
 
   try {
-    log(`[Auth Start] Запуск Firefox для домена: ${domain}`);
+    log(`[Auth Start] Запуск Firefox авторизации для домена: ${domain}`);
 
-    // В Firefox SOCKS5 с логином и паролем передается нативно через `--proxy-server`
+    // Firefox нативно поддерживает SOCKS5 прокси с логином и паролем в URL
     const proxyUrl = `socks5://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`;
+    log(`[Auth Proxy] Подключение к SOCKS5: ${PROXY_HOST}:${PROXY_PORT}`);
 
     browser = await puppeteer.launch({
-      product: 'firefox',
+      browser: 'firefox',
+      extraPrefsFirefox: {
+        'network.proxy.type': 1,
+        'network.proxy.socks': PROXY_HOST,
+        'network.proxy.socks_port': parseInt(PROXY_PORT),
+        'network.proxy.socks_version': 5,
+        'network.proxy.socks_remote_dns': true
+      },
       args: [
         `--proxy-server=${proxyUrl}`,
         '--no-sandbox',
@@ -88,13 +100,16 @@ async function performPuppeteerAuth(domain, login, password) {
       headless: true
     });
 
+    log(`[Auth Browser] Firefox запущен. Создаем новую страницу...`);
     const page = await browser.newPage();
 
     log(`[Auth Step 1] Переход на ${targetUrl}...`);
+    const startTime = Date.now();
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    log(`[Auth Step 1.1] Страница загружена за ${((Date.now() - startTime) / 1000).toFixed(2)}s`);
 
     let currentTitle = await page.title();
-    log(`[Auth Step 1.1] Title: "${currentTitle}"`);
+    log(`[Auth Step 1.2] Title: "${currentTitle}"`);
 
     log(`[Auth Step 2] Ожидание инпута login...`);
     await page.waitForSelector('input[name="login"]', { timeout: 20000 });
@@ -105,12 +120,17 @@ async function performPuppeteerAuth(domain, login, password) {
 
     log(`[Auth Step 4] Отправка формы...`);
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => log(`[Nav Warning] ${e.message}`)),
       page.keyboard.press('Enter')
     ]);
 
     await new Promise(r => setTimeout(r, 2000));
 
+    const finalUrl = page.url();
+    const finalTitle = await page.title();
+    log(`[Auth Step 5] URL: ${finalUrl} | Title: "${finalTitle}"`);
+
+    log(`[Auth Step 6] Чтение куки...`);
     const rawCookies = await page.cookies();
     const cookiesObj = {};
     rawCookies.forEach(c => { cookiesObj[c.name] = c.value; });
@@ -118,12 +138,15 @@ async function performPuppeteerAuth(domain, login, password) {
     const cookieString = rawCookies.map(c => `${c.name}=${c.value}`).join('; ');
     const ussidVal = cookiesObj['ussid'];
 
-    log(`[Auth Step 5] ussid: "${ussidVal || 'НЕ ПОЛУЧЕН'}"`);
+    log(`[Auth Step 6.1] Кук получено: ${rawCookies.length}. ussid: "${ussidVal || 'НЕ ПОЛУЧЕН'}"`);
+
+    const isSuccess = Boolean(ussidVal && ussidVal !== 'deleted');
 
     await browser.close();
+    log(`[Auth Finish] Завершено. Статус: ${isSuccess ? 'УСПЕХ' : 'ОШИБКА'}`);
 
-    if (!ussidVal || ussidVal === 'deleted') {
-      throw new Error(`Авторизация не удалась (ussid=${ussidVal || 'null'})`);
+    if (!isSuccess) {
+      throw new Error(`Авторизация не удалась (ussid=${ussidVal || 'null'}). Title: "${finalTitle}"`);
     }
 
     return {
@@ -136,7 +159,9 @@ async function performPuppeteerAuth(domain, login, password) {
 
   } catch (err) {
     log(`[Auth Exception] Ошибка: ${err.message}`);
-    if (browser) await browser.close().catch(() => {});
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
     return {
       success: false,
       error: err.message,
@@ -145,6 +170,9 @@ async function performPuppeteerAuth(domain, login, password) {
   }
 }
 
+/**
+ * Получение ставок из корзины (через SOCKS5)
+ */
 async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
   const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
@@ -166,13 +194,7 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
     'cookie': cookieString,
     'origin': `https://${domain}`,
     'referer': `https://${domain}/betting/index.php?page=line&action=2`,
-    'sec-ch-ua': '"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest': 'empty',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-site': 'same-origin',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
     'x-requested-with': 'XMLHttpRequest'
   };
 
@@ -194,10 +216,7 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
     });
 
     const betslip = response.data?.betslip;
-
-    if (!betslip) {
-      return null;
-    }
+    if (!betslip) return null;
 
     const keys = Object.keys(betslip);
     if (keys.length === 0) return null;
@@ -209,8 +228,12 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   }
 }
 
+// ---------------------------------------------------------------------
+// МАРШРУТЫ API
+// ---------------------------------------------------------------------
+
 app.get('/', (req, res) => {
-  res.send('Auth & Basket Service is Live');
+  res.send('Auth & Basket Service (Firefox) is Live');
 });
 
 const handleAuth = async (req, res) => {
