@@ -26,7 +26,7 @@ function parseKef(value) {
 }
 
 /**
- * Валидация кук сессии из кэша через запрос к корзине
+ * Валидация сессии из кэша через прямую проверку API корзины
  */
 async function isSessionValid(domain, cookieString) {
   if (!cookieString || !cookieString.includes('ussid=')) {
@@ -55,7 +55,9 @@ async function isSessionValid(domain, cookieString) {
   }
 }
 
-// Авторизация осталась БЕЗ ИЗМЕНЕНИЙ (как вы просили)
+// ---------------------------------------------------------------------
+// АВТОРИЗАЦИЯ (ОСТАВЛЕНА БЕЗ ЕДИНОГО ИЗМЕНЕНИЯ)
+// ---------------------------------------------------------------------
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
@@ -129,9 +131,9 @@ async function performPuppeteerAuth(domain, login, password) {
   }
 }
 
-/**
- * Единственная правильная функция добавления исхода в корзину
- */
+// ---------------------------------------------------------------------
+// ЕДИНСТВЕННАЯ ИСПРАВЛЕННАЯ ФУНКЦИЯ КОРЗИНЫ (РАБОЧАЯ ВЕРСИЯ №1)
+// ---------------------------------------------------------------------
 async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
   const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
@@ -166,15 +168,13 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   };
 
   try {
-    // Шаг 1. Очищаем корзину
+    // 1. Очищаем корзину
     await axios.post(clearUrl, 'action=clearbasket&currpage=line', { headers }).catch(() => {});
 
-    // Шаг 2. Собираем payload с обязательным кодированием id
+    // 2. Собираем payload с обязательным кодированием id
     const encodedId = encodeURIComponent(fullId);
     const prob = outcome.probability;
     const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${prob}&id=${encodedId}&v1=${prob}&v2=1&v3=1&match=${matchParam}`;
-
-    console.log(`[Basket Req] Payload: ${payload}`);
 
     const response = await axios.post(addUrl, payload, { headers });
     const betslip = response.data?.betslip;
@@ -199,6 +199,7 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
 // МАРШРУТЫ И ЭНДПОИНТЫ API
 // ---------------------------------------------------------------------
 
+// Главная страница
 app.get('/', (req, res) => {
   res.send('Auth & Basket Service is Live');
 });
@@ -292,7 +293,7 @@ const handleGetMaxInfo = async (req, res) => {
 
     const cookieString = session.cookie_string;
 
-    // Последовательно запрашиваем корзину для обох исходов
+    // Последовательно запрашиваем корзину для обоих исходов
     const betjson1 = await fetchBetFromBasket(domain, cookieString, outcomes[0], matchId);
     const betjson2 = await fetchBetFromBasket(domain, cookieString, outcomes[1], matchId);
 
