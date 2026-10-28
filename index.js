@@ -3,6 +3,7 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const chromium = require('@sparticuz/chromium');
 const axios = require('axios');
+const { SocksProxyAgent } = require('socks-proxy-agent');
 
 puppeteer.use(StealthPlugin());
 
@@ -11,6 +12,15 @@ const app = express();
 // Поддержка JSON и URL-encoded данных
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Данные SOCKS5 прокси
+const PROXY_HOST = process.env.PROXY_HOST || '194.67.199.219';
+const PROXY_PORT = process.env.PROXY_PORT || '33129';
+const PROXY_USER = process.env.PROXY_USER || 'security';
+const PROXY_PASS = process.env.PROXY_PASS || 'xLKmvUg7652eTPVIs7nr';
+
+// SOCKS5 Агент для Axios
+const socksAgent = new SocksProxyAgent(`socks5://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`);
 
 // In-Memory кэш сессий
 const sessionCache = {};
@@ -26,7 +36,7 @@ function parseKef(value) {
 }
 
 /**
- * Валидация сессии из кэша через прямую проверку API корзины
+ * Валидация сессии из кэша через прокси
  */
 async function isSessionValid(domain, cookieString) {
   if (!cookieString || !cookieString.includes('ussid=')) {
@@ -40,6 +50,8 @@ async function isSessionValid(domain, cookieString) {
         'Cookie': cookieString,
         'X-Requested-With': 'XMLHttpRequest'
       },
+      httpsAgent: socksAgent,
+      httpAgent: socksAgent,
       maxRedirects: 0,
       timeout: 5000,
       validateStatus: (status) => status >= 200 && status < 400
@@ -56,14 +68,13 @@ async function isSessionValid(domain, cookieString) {
 }
 
 // ---------------------------------------------------------------------
-// АВТОРИЗАЦИЯ (ЛОГИКА ОСТАВЛЕНА БЕЗ ИЗМЕНЕНИЙ)
+// АВТОРИЗАЦИЯ ПУППЕТИРА (С ПОДДКЛЮЧЕНИЕМ SOCKS5 ПРОКСИ)
 // ---------------------------------------------------------------------
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
 
   try {
-    // Выключаем графику для защиты от сбоев памяти на Render
     chromium.setGraphicsMode = false;
     const executablePath = await chromium.executablePath();
 
@@ -74,7 +85,9 @@ async function performPuppeteerAuth(domain, login, password) {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
-        '--disable-gpu'
+        '--disable-gpu',
+        '--single-process',
+        `--proxy-server=socks5://${PROXY_HOST}:${PROXY_PORT}`
       ],
       defaultViewport: chromium.defaultViewport,
       executablePath: executablePath,
@@ -83,6 +96,12 @@ async function performPuppeteerAuth(domain, login, password) {
     });
 
     const page = await browser.newPage();
+
+    // Авторизация на SOCKS5 прокси
+    await page.authenticate({
+      username: PROXY_USER,
+      password: PROXY_PASS
+    });
 
     await page.setRequestInterception(true);
     page.on('request', (req) => {
@@ -96,8 +115,8 @@ async function performPuppeteerAuth(domain, login, password) {
 
     await page.setViewport({ width: 1366, height: 768 });
 
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForSelector('input[name="login"]', { timeout: 15000 });
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
+    await page.waitForSelector('input[name="login"]', { timeout: 20000 });
 
     await page.type('input[name="login"]', login, { delay: 20 });
     await page.type('input[name="passw"]', password, { delay: 20 });
@@ -133,7 +152,7 @@ async function performPuppeteerAuth(domain, login, password) {
 }
 
 // ---------------------------------------------------------------------
-// ФУНКЦИЯ КОРЗИНЫ
+// ФУНКЦИЯ КОРЗИНЫ (ЧЕРЕЗ SOCKS5 PROXY)
 // ---------------------------------------------------------------------
 async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
@@ -167,7 +186,11 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   };
 
   try {
-    await axios.post(clearUrl, 'action=clearbasket&currpage=line', { headers }).catch(() => {});
+    await axios.post(clearUrl, 'action=clearbasket&currpage=line', { 
+      headers,
+      httpsAgent: socksAgent,
+      httpAgent: socksAgent 
+    }).catch(() => {});
 
     const encodedId = encodeURIComponent(fullId);
     const prob = outcome.probability;
@@ -175,7 +198,12 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
 
     console.log(`[Basket Req] Payload: ${payload}`);
 
-    const response = await axios.post(addUrl, payload, { headers });
+    const response = await axios.post(addUrl, payload, { 
+      headers,
+      httpsAgent: socksAgent,
+      httpAgent: socksAgent 
+    });
+
     const betslip = response.data?.betslip;
 
     if (!betslip) {
