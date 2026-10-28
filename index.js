@@ -14,7 +14,6 @@ const PROXY_PORT = process.env.PROXY_PORT || '33129';
 const PROXY_USER = process.env.PROXY_USER || 'security';
 const PROXY_PASS = process.env.PROXY_PASS || 'xLKmvUg7652eTPVIs7nr';
 
-// SOCKS5 Агент для Axios
 const socksAgent = new SocksProxyAgent(`socks5://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`);
 
 const sessionCache = {};
@@ -29,9 +28,6 @@ function parseKef(value) {
   return parseFloat(value) || 0;
 }
 
-/**
- * Валидация сессии из кэша через API корзины
- */
 async function isSessionValid(domain, cookieString) {
   if (!cookieString || !cookieString.includes('ussid=')) {
     return false;
@@ -61,9 +57,6 @@ async function isSessionValid(domain, cookieString) {
   }
 }
 
-/**
- * Авторизация через Puppeteer (Firefox) c нативной поддержкой SOCKS5
- */
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
@@ -77,18 +70,17 @@ async function performPuppeteerAuth(domain, login, password) {
   };
 
   try {
+    log(`[Auth Start] Запуск Firefox авторизации для домена: ${domain}`);
     log(`[Auth Proxy] Настройка SOCKS5 в Firefox для ${PROXY_HOST}:${PROXY_PORT}`);
 
     browser = await puppeteer.launch({
       browser: 'firefox',
       extraPrefsFirefox: {
-        // 1 = Ручная настройка прокси
         'network.proxy.type': 1,
         'network.proxy.socks': PROXY_HOST,
         'network.proxy.socks_port': parseInt(PROXY_PORT, 10),
         'network.proxy.socks_version': 5,
         'network.proxy.socks_remote_dns': true,
-        // Передача учётных данных SOCKS5 прокси для Firefox
         'network.proxy.socks_username': PROXY_USER,
         'network.proxy.socks_password': PROXY_PASS
       },
@@ -99,7 +91,7 @@ async function performPuppeteerAuth(domain, login, password) {
       headless: true
     });
 
-    log(`[Auth Browser] Firefox запущен. Создаем новую страницу...`);
+    log(`[Auth Browser] Firefox запущен. Открываем новую страницу...`);
     const page = await browser.newPage();
 
     log(`[Auth Step 1] Переход на ${targetUrl}...`);
@@ -169,9 +161,6 @@ async function performPuppeteerAuth(domain, login, password) {
   }
 }
 
-/**
- * Получение ставок из корзины (через SOCKS5)
- */
 async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
   const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
@@ -226,10 +215,6 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
     return null;
   }
 }
-
-// ---------------------------------------------------------------------
-// МАРШРУТЫ API
-// ---------------------------------------------------------------------
 
 app.get('/', (req, res) => {
   res.send('Auth & Basket Service (Firefox) is Live');
