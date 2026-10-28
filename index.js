@@ -64,7 +64,7 @@ async function isSessionValid(domain, cookieString) {
 }
 
 /**
- * Авторизация через Puppeteer (Firefox) с обработкой Client Challenge и SOCKS5
+ * Авторизация через Puppeteer (Firefox) с SOCKS5 и чистым Headless
  */
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
@@ -115,6 +115,7 @@ async function performPuppeteerAuth(domain, login, password) {
 
     const launchOptions = {
       browser: 'firefox',
+      headless: true,
       extraPrefsFirefox: {
         'network.proxy.type': 1,
         'network.proxy.socks': PROXY_HOST,
@@ -125,10 +126,10 @@ async function performPuppeteerAuth(domain, login, password) {
         'network.proxy.socks_password': PROXY_PASS
       },
       args: [
+        '--headless',
         '--no-sandbox',
         '--disable-setuid-sandbox'
-      ],
-      headless: true
+      ]
     };
 
     if (firefoxPath) {
