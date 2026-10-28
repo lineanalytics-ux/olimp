@@ -77,22 +77,22 @@ async function performPuppeteerAuth(domain, login, password) {
   };
 
   try {
-    log(`[Auth Proxy] Подключение к SOCKS5: ${PROXY_HOST}:${PROXY_PORT}`);
-
-    // Полная URL-строка для Firefox SOCKS5
-    const proxyUrl = `socks5://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`;
+    log(`[Auth Proxy] Настройка SOCKS5 в Firefox для ${PROXY_HOST}:${PROXY_PORT}`);
 
     browser = await puppeteer.launch({
       browser: 'firefox',
       extraPrefsFirefox: {
+        // 1 = Ручная настройка прокси
         'network.proxy.type': 1,
         'network.proxy.socks': PROXY_HOST,
-        'network.proxy.socks_port': parseInt(PROXY_PORT),
+        'network.proxy.socks_port': parseInt(PROXY_PORT, 10),
         'network.proxy.socks_version': 5,
-        'network.proxy.socks_remote_dns': true
+        'network.proxy.socks_remote_dns': true,
+        // Передача учётных данных SOCKS5 прокси для Firefox
+        'network.proxy.socks_username': PROXY_USER,
+        'network.proxy.socks_password': PROXY_PASS
       },
       args: [
-        `--proxy-server=${proxyUrl}`,
         '--no-sandbox',
         '--disable-setuid-sandbox'
       ],
