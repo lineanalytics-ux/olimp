@@ -59,6 +59,9 @@ async function isSessionValid(domain, cookieString) {
 /**
  * Надежная авторизация через Puppeteer
  */
+/**
+ * Надежная авторизация через Puppeteer с прямым вызовом submit()
+ */
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
@@ -84,11 +87,14 @@ async function performPuppeteerAuth(domain, login, password) {
 
     const page = await browser.newPage();
 
-    // Блокировка тяжелых ресурсов
+    // Задаем реальный User-Agent
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36');
+
+    // Блокировка только тяжелых медиафайлов (оставляем скрипты и стили)
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const resourceType = req.resourceType();
-      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+      if (['image', 'font', 'media'].includes(resourceType)) {
         req.abort();
       } else {
         req.continue();
@@ -97,24 +103,32 @@ async function performPuppeteerAuth(domain, login, password) {
 
     await page.setViewport({ width: 1366, height: 768 });
 
-    // 1. Загрузка главной
+    // 1. Загрузка страницы
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    // 2. Ждем появления формы авторизации
     await page.waitForSelector('input[name="login"]', { timeout: 15000 });
 
-    // 2. Заполнение полей
-    await page.type('input[name="login"]', login, { delay: 30 });
-    await page.type('input[name="passw"]', password, { delay: 30 });
+    // 3. Ввод данных
+    await page.type('input[name="login"]', login, { delay: 20 });
+    await page.type('input[name="passw"]', password, { delay: 20 });
 
-    // 3. Нажатие клавиши входа и ожидание редиректа
+    // 4. Отправка формы напрямую через JS страницы
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
-      page.keyboard.press('Enter')
+      page.evaluate(() => {
+        const loginInput = document.querySelector('input[name="login"]');
+        if (loginInput) {
+          const form = loginInput.closest('form');
+          if (form) form.submit();
+        }
+      })
     ]);
 
-    // Пауза 3 секунды для гарантированной установки Set-Cookie от сервера
+    // Пауза 3 секунды для простановки кук
     await new Promise(r => setTimeout(r, 3000));
 
-    // 4. Забор кук
+    // 5. Забор кук
     const rawCookies = await page.cookies();
     const cookiesObj = {};
     rawCookies.forEach(c => { cookiesObj[c.name] = c.value; });
@@ -125,6 +139,7 @@ async function performPuppeteerAuth(domain, login, password) {
     await browser.close();
 
     if (!isSuccess) {
+      console.log('[Auth Debug] Полученные куки:', JSON.stringify(cookiesObj));
       throw new Error('Авторизация не удалась (ussid не получен)');
     }
 
