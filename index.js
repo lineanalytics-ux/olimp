@@ -12,13 +12,11 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Данные SOCKS5 Прокси
 const PROXY_HOST = process.env.PROXY_HOST || '194.67.199.219';
 const PROXY_PORT = process.env.PROXY_PORT || '33129';
 const PROXY_USER = process.env.PROXY_USER || 'security';
 const PROXY_PASS = process.env.PROXY_PASS || 'xLKmvUg7652eTPVIs7nr';
 
-// SOCKS5 Агент для Axios
 const socksAgent = new SocksProxyAgent(`socks5://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`);
 
 const sessionCache = {};
@@ -78,10 +76,11 @@ async function performPuppeteerAuth(domain, login, password) {
     log(`[Auth Start] Запуск авторизации для домена: ${domain}`);
     
     log(`[Auth Setup] Настройка Chromium...`);
+    
+    // Предотвращение блокировки файла Chromium
     chromium.setGraphicsMode = false;
     const executablePath = await chromium.executablePath();
 
-    // Чистый синтаксис SOCKS5 без логина/пароля в URL
     const proxyUrl = `socks5://${PROXY_HOST}:${PROXY_PORT}`;
     log(`[Auth Proxy] Подключение к ${proxyUrl}`);
 
@@ -93,6 +92,7 @@ async function performPuppeteerAuth(domain, login, password) {
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
+        '--single-process',
         `--proxy-server=${proxyUrl}`
       ],
       defaultViewport: { width: 1366, height: 768 },
