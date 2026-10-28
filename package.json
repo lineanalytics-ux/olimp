@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "postinstall": "npx playwright install --with-deps firefox"
+    "postinstall": "npx playwright install firefox"
   },
   "dependencies": {
     "axios": "^1.6.0",
