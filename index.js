@@ -11,7 +11,6 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// In-Memory кэш сессий
 const sessionCache = {};
 
 function parseKef(value) {
@@ -24,9 +23,6 @@ function parseKef(value) {
   return parseFloat(value) || 0;
 }
 
-/**
- * СТРОГАЯ проверка валидности сессии
- */
 async function isSessionValid(domain, cookieString) {
   if (!cookieString || !cookieString.includes('ussid=')) {
     return false;
@@ -35,7 +31,7 @@ async function isSessionValid(domain, cookieString) {
   try {
     const response = await axios.get(`https://${domain}/ajax_basket_index.php?_r=${Math.random()}`, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Cookie': cookieString,
         'X-Requested-With': 'XMLHttpRequest'
       },
@@ -47,9 +43,7 @@ async function isSessionValid(domain, cookieString) {
     const setCookie = response.headers['set-cookie'] || [];
     const isDeleted = setCookie.some(header => header.includes('ussid=deleted'));
 
-    // Проверяем, что сервер не вернул сброс ussid и отдал JSON корзины
     if (isDeleted) return false;
-    
     return Boolean(response.data && typeof response.data === 'object');
   } catch (err) {
     return false;
@@ -57,14 +51,20 @@ async function isSessionValid(domain, cookieString) {
 }
 
 /**
- * Прямая отправка формы через Puppeteer بدون ожидания селекторов DOM
+ * Подробная авторизация с расширенным логированием
  */
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
-  const loginUrl = `https://${domain}/index.php`;
+  const debugLogs = [];
+
+  const log = (msg) => {
+    console.log(msg);
+    debugLogs.push(msg);
+  };
 
   try {
+    log(`[Auth Start] Запуск авторизации для домена: ${domain}`);
     const executablePath = await chromium.executablePath();
 
     browser = await puppeteer.launch({
@@ -84,88 +84,78 @@ async function performPuppeteerAuth(domain, login, password) {
     });
 
     const page = await browser.newPage();
-
-    // Задаем реальный User-Agent Chrome
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1366, height: 768 });
 
-    // 1. Переходим на главную страницу, чтобы прошел защитный челлендж и проставился PHPSESSID
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    log(`[Auth Step 1] Переход на ${targetUrl}`);
+    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 45000 });
 
-    // Парсим текущий PHPSESSID и asid со страницы
-    const cookiesBefore = await page.cookies();
-    const phpsessidCookie = cookiesBefore.find(c => c.name === 'PHPSESSID');
-    const phpsessid = phpsessidCookie ? phpsessidCookie.value : '';
+    const initialTitle = await page.title();
+    log(`[Auth Step 1] Заголовок страницы: "${initialTitle}"`);
 
-    // Извлекаем asid из HTML
-    const pageHtml = await page.content();
-    let asid = null;
-    const matchAsid = pageHtml.match(/name=["']asid["']\s+value=["']([^"']+)["']/i) ||
-                      pageHtml.match(/asid\s*=\s*['"]?(\d+)['"]?/i);
-    if (matchAsid && matchAsid[1]) {
-      asid = matchAsid[1];
-    } else {
-      asid = Math.floor(Math.random() * 10000000).toString();
+    // Поиск формы логина
+    log(`[Auth Step 2] Ожидание инпута login...`);
+    const loginInput = await page.waitForSelector('input[name="login"]', { timeout: 20000 }).catch(() => null);
+
+    if (!loginInput) {
+      const pageSnippet = (await page.content()).substring(0, 500);
+      log(`[Auth Error] Инпут login не найден! Сниппет HTML:\n${pageSnippet}`);
+      throw new Error('Инпут login не найден на странице');
     }
 
-    // 2. Выполняем POST-запрос авторизации напрямую из браузерного контекста
-    await page.evaluate(async (url, loginVal, passVal, asidVal, psidVal) => {
-      const form = document.createElement('form');
-      form.method = 'POST';
-      form.action = url;
+    log(`[Auth Step 3] Ввод учетных данных...`);
+    await page.type('input[name="login"]', login, { delay: 40 });
+    await page.type('input[name="passw"]', password, { delay: 40 });
 
-      const fields = {
-        'login': loginVal,
-        'passw': passVal,
-        'asid': asidVal,
-        'psid': psidVal
-      };
+    log(`[Auth Step 4] Отправка формы по нажатию Enter...`);
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(e => log(`[Auth Nav Warning] ${e.message}`)),
+      page.keyboard.press('Enter')
+    ]);
 
-      for (const name in fields) {
-        const input = document.createElement('input');
-        input.type = 'hidden';
-        input.name = name;
-        input.value = fields[name];
-        form.appendChild(input);
-      }
+    await new Promise(r => setTimeout(r, 4000));
 
-      document.body.appendChild(form);
-      form.submit();
-    }, loginUrl, login, password, asid, phpsessid);
+    const finalUrl = page.url();
+    const finalTitle = await page.title();
+    log(`[Auth Step 5] Итоговый URL: ${finalUrl}`);
+    log(`[Auth Step 5] Итоговый Title: "${finalTitle}"`);
 
-    // Ждем завершения редиректа после сабмита
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    await new Promise(r => setTimeout(r, 3000));
-
-    // 3. Собираем куки
     const rawCookies = await page.cookies();
     const cookiesObj = {};
     rawCookies.forEach(c => { cookiesObj[c.name] = c.value; });
 
     const cookieString = rawCookies.map(c => `${c.name}=${c.value}`).join('; ');
-    const isSuccess = Boolean(cookiesObj['ussid'] && cookiesObj['ussid'] !== 'deleted');
+    const ussidVal = cookiesObj['ussid'];
+
+    log(`[Auth Step 6] Полученные куки ключи: ${Object.keys(cookiesObj).join(', ')}`);
+    log(`[Auth Step 6] Значение ussid: "${ussidVal}"`);
+
+    const isSuccess = Boolean(ussidVal && ussidVal !== 'deleted');
 
     await browser.close();
 
     if (!isSuccess) {
-      throw new Error('Авторизация не удалась (ussid не получен)');
+      throw new Error(`Авторизация не удалась (ussid=${ussidVal || 'null'}). Итоговый title: "${finalTitle}"`);
     }
 
     return {
       success: true,
-      ussid: cookiesObj['ussid'],
+      ussid: ussidVal,
       cookies: cookiesObj,
-      cookie_string: cookieString
+      cookie_string: cookieString,
+      logs: debugLogs
     };
 
   } catch (err) {
     if (browser) await browser.close();
-    throw err;
+    return {
+      success: false,
+      error: err.message,
+      logs: debugLogs
+    };
   }
 }
 
-/**
- * Отправка исхода в корзину
- */
 async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
   const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
@@ -187,21 +177,19 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
     'cookie': cookieString,
     'origin': `https://${domain}`,
     'referer': `https://${domain}/betting/index.php?page=line&action=2`,
-    'sec-ch-ua': '"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"',
+    'sec-ch-ua': '"Not:A-Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'x-requested-with': 'XMLHttpRequest'
   };
 
   try {
-    // 1. Очистка корзины
     await axios.post(clearUrl, 'action=clearbasket&currpage=line', { headers }).catch(() => {});
 
-    // 2. Добавление коэффицента
     const encodedId = encodeURIComponent(fullId);
     const prob = outcome.probability;
     const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${prob}&id=${encodedId}&v1=${prob}&v2=1&v3=1&match=${matchParam}`;
@@ -210,7 +198,6 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
     const betslip = response.data?.betslip;
 
     if (!betslip) {
-      console.log(`[Basket Fail] Ответ:`, JSON.stringify(response.data));
       return null;
     }
 
@@ -232,7 +219,6 @@ app.get('/', (req, res) => {
   res.send('Auth & Basket Service is Live');
 });
 
-// Единый обработчик /auth
 const handleAuth = async (req, res) => {
   const login = req.query?.login || req.body?.login;
   const password = req.query?.password || req.body?.password;
@@ -248,7 +234,6 @@ const handleAuth = async (req, res) => {
   const forceRefresh = req.query?.force === 'true' || req.body?.force === 'true';
 
   try {
-    // Если НЕ принудительное обновление — проверяем кэш
     if (!forceRefresh && sessionCache[cacheKey]) {
       const cachedSession = sessionCache[cacheKey];
       const valid = await isSessionValid(domain, cachedSession.cookie_string);
@@ -261,12 +246,19 @@ const handleAuth = async (req, res) => {
       }
     }
 
-    // Если кэш невалиден или передан force=true -> заново заходим через Puppeteer
-    console.log(`[Auth] Выполняем свежий вход через Puppeteer...`);
     const authResult = await performPuppeteerAuth(domain, login, password);
 
+    if (!authResult.success) {
+      return res.status(500).json({
+        success: false,
+        domain: domain,
+        error: authResult.error,
+        debug_logs: authResult.logs
+      });
+    }
+
     sessionCache[cacheKey] = {
-      success: authResult.success,
+      success: true,
       ussid: authResult.ussid,
       cookies: authResult.cookies,
       cookie_string: authResult.cookie_string,
@@ -276,7 +268,8 @@ const handleAuth = async (req, res) => {
     return res.json({
       from_cache: false,
       domain: domain,
-      ...sessionCache[cacheKey]
+      ...sessionCache[cacheKey],
+      debug_logs: authResult.logs
     });
 
   } catch (err) {
@@ -291,7 +284,6 @@ const handleAuth = async (req, res) => {
 app.get('/auth', handleAuth);
 app.post('/auth', handleAuth);
 
-// Единый обработчик /getmaxinfo
 const handleGetMaxInfo = async (req, res) => {
   const login = req.query?.login || req.body?.login || '77088167661';
   const password = req.query?.password || req.body?.password || 'Almaty2026';
@@ -310,12 +302,17 @@ const handleGetMaxInfo = async (req, res) => {
   try {
     let session = sessionCache[cacheKey];
     
-    // Проверяем жива ли сессия в кэше, если нет — переавторизуемся
     if (!session || !(await isSessionValid(domain, session.cookie_string))) {
-      console.log(`[GetMaxInfo] Сессия невалидна. Запускаем Puppeteer...`);
       const authResult = await performPuppeteerAuth(domain, login, password);
+      if (!authResult.success) {
+        return res.json({
+          success: false,
+          error: `Ошибка авторизации: ${authResult.error}`,
+          logs: authResult.logs
+        });
+      }
       sessionCache[cacheKey] = {
-        success: authResult.success,
+        success: true,
         ussid: authResult.ussid,
         cookies: authResult.cookies,
         cookie_string: authResult.cookie_string,
