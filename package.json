@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "postinstall": "npx puppeteer browsers install firefox@stable"
+    "postinstall": "npx puppeteer browsers install firefox@stable_120.0"
   },
   "dependencies": {
     "axios": "^1.6.0",
