@@ -25,12 +25,20 @@ function parseKef(value) {
   return parseFloat(value) || 0;
 }
 
+/**
+ * Валидация кук сессии из кэша через запрос к корзине
+ */
 async function isSessionValid(domain, cookieString) {
+  if (!cookieString || !cookieString.includes('ussid=')) {
+    return false;
+  }
+
   try {
-    const response = await axios.get(`https://${domain}/`, {
+    const response = await axios.get(`https://${domain}/ajax_basket_index.php?_r=${Math.random()}`, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
-        'Cookie': cookieString
+        'Cookie': cookieString,
+        'X-Requested-With': 'XMLHttpRequest'
       },
       maxRedirects: 0,
       timeout: 5000,
@@ -38,12 +46,16 @@ async function isSessionValid(domain, cookieString) {
     });
 
     const setCookie = response.headers['set-cookie'] || [];
-    return !setCookie.some(header => header.includes('ussid=deleted'));
+    const isDeleted = setCookie.some(header => header.includes('ussid=deleted'));
+
+    if (isDeleted) return false;
+    return Boolean(response.data && typeof response.data === 'object');
   } catch (err) {
     return false;
   }
 }
 
+// Авторизация осталась БЕЗ ИЗМЕНЕНИЙ (как вы просили)
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
@@ -118,7 +130,7 @@ async function performPuppeteerAuth(domain, login, password) {
 }
 
 /**
- * Функция добавления исхода в корзину (с точным сбором параметров)
+ * Единственная правильная функция добавления исхода в корзину
  */
 async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
@@ -187,7 +199,6 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
 // МАРШРУТЫ И ЭНДПОИНТЫ API
 // ---------------------------------------------------------------------
 
-// Главная страница
 app.get('/', (req, res) => {
   res.send('Auth & Basket Service is Live');
 });
@@ -249,79 +260,6 @@ app.get('/auth', handleAuth);
 app.post('/auth', handleAuth);
 
 // Обработчик /getmaxinfo (поддерживает GET и POST)
-/**
- * Функция отправки исхода в корзину (соответствует структурам curl)
- */
-async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
-  const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
-  const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
-
-  // 1. Формирование корректного ID для добавления в корзину
-  let rawBasketId = String(outcome.basketId || '');
-  let originalId = String(outcome.originalId || '');
-
-  let fullId = '';
-  if (rawBasketId.startsWith(originalId)) {
-    fullId = rawBasketId;
-  } else {
-    fullId = `${originalId}:${rawBasketId}`;
-  }
-
-  // Если в ID меньше 9 элементов через двоеточие, добавляем хвост
-  if ((fullId.match(/:/g) || []).length < 9) {
-    fullId += ':140612801';
-  }
-
-  // Извлекаем matchId для корзины (86173165)
-  const parts = rawBasketId.split(':');
-  const matchParam = parts.length > 1 ? parts[0] : (parts[0] || matchId);
-
-  const headers = {
-    'accept': 'application/json, text/javascript, */*; q=0.01',
-    'accept-language': 'ru,en-US;q=0.9,en;q=0.8',
-    'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
-    'cookie': cookieString,
-    'origin': `https://${domain}`,
-    'referer': `https://${domain}/betting/index.php?page=line&action=2`,
-    'sec-ch-ua': '"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest': 'empty',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-site': 'same-origin',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
-    'x-requested-with': 'XMLHttpRequest'
-  };
-
-  try {
-    // 1. Очищаем корзину
-    await axios.post(clearUrl, 'action=clearbasket&currpage=line', { headers }).catch(() => {});
-
-    // 2. Добавляем исход
-    const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${outcome.probability}&id=${encodeURIComponent(fullId)}&v1=${outcome.probability}&v2=1&v3=1&match=${matchParam}`;
-
-    const response = await axios.post(addUrl, payload, { headers });
-    const betslip = response.data?.betslip;
-
-    if (!betslip) {
-      console.log('[Basket Fail] Пустой betslip:', JSON.stringify(response.data));
-      return null;
-    }
-
-    const keys = Object.keys(betslip);
-    if (keys.length === 0) return null;
-
-    // Возвращаем объект добавленного исхода
-    return betslip[keys[0]];
-  } catch (e) {
-    console.log(`[Basket Exception] ${e.message}`);
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------
-// ОБРАБОТЧИК /getmaxinfo
-// ---------------------------------------------------------------------
 const handleGetMaxInfo = async (req, res) => {
   const login = req.query?.login || req.body?.login || '77088167661';
   const password = req.query?.password || req.body?.password || 'Almaty2026';
