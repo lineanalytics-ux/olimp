@@ -33,9 +33,6 @@ function parseKef(value) {
   return parseFloat(value) || 0;
 }
 
-/**
- * Валидация сессии из кэша через API корзины с использованием SOCKS5
- */
 async function isSessionValid(domain, cookieString) {
   if (!cookieString || !cookieString.includes('ussid=')) {
     return false;
@@ -65,9 +62,6 @@ async function isSessionValid(domain, cookieString) {
   }
 }
 
-/**
- * Авторизация Puppeteer через SOCKS5 с логами и исправленным форматом прокси
- */
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
@@ -83,14 +77,13 @@ async function performPuppeteerAuth(domain, login, password) {
   try {
     log(`[Auth Start] Запуск авторизации для домена: ${domain}`);
     
-    log(`[Auth Setup] Настройка Chromium и поиск бинарника...`);
+    log(`[Auth Setup] Настройка Chromium...`);
     chromium.setGraphicsMode = false;
     const executablePath = await chromium.executablePath();
-    log(`[Auth Setup] Путь к Chromium: ${executablePath}`);
 
-    // Передаем полную SOCKS5 строку с учётными данными
-    const proxyUrl = `socks5://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`;
-    log(`[Auth Proxy] Подключение к SOCKS5 через ${PROXY_HOST}:${PROXY_PORT}`);
+    // Чистый синтаксис SOCKS5 без логина/пароля в URL
+    const proxyUrl = `socks5://${PROXY_HOST}:${PROXY_PORT}`;
+    log(`[Auth Proxy] Подключение к ${proxyUrl}`);
 
     browser = await puppeteer.launch({
       args: [
@@ -100,8 +93,7 @@ async function performPuppeteerAuth(domain, login, password) {
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
-        `--proxy-server=${proxyUrl}`,
-        '--host-resolver-rules="MAP * 0.0.0.0, EXCLUDE localhost"'
+        `--proxy-server=${proxyUrl}`
       ],
       defaultViewport: { width: 1366, height: 768 },
       executablePath: executablePath,
@@ -109,16 +101,16 @@ async function performPuppeteerAuth(domain, login, password) {
       ignoreHTTPSErrors: true,
     });
 
-    log(`[Auth Browser] Браузер успешно запущен. Создаем новую вкладку...`);
+    log(`[Auth Browser] Браузер запущен. Открываем вкладку...`);
     const page = await browser.newPage();
 
-    log(`[Auth Proxy Auth] Резервная авторизация прокси на уровне страницы...`);
+    log(`[Auth Proxy Auth] Передача логина и пароля прокси...`);
     await page.authenticate({
       username: PROXY_USER,
       password: PROXY_PASS
     });
 
-    log(`[Auth Interceptor] Перехват запросов (фильтрация картинок и медиа)...`);
+    log(`[Auth Interceptor] Включение перехвата запросов...`);
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const resourceType = req.resourceType();
@@ -129,51 +121,48 @@ async function performPuppeteerAuth(domain, login, password) {
       }
     });
 
-    log(`[Auth Step 1] Переход на ${targetUrl} (таймаут 45с)...`);
+    log(`[Auth Step 1] Переход на ${targetUrl}...`);
     const startTime = Date.now();
     
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
     log(`[Auth Step 1.1] Страница загружена за ${((Date.now() - startTime) / 1000).toFixed(2)}s`);
 
     let currentTitle = await page.title();
-    log(`[Auth Step 1.2] Заголовок страницы: "${currentTitle}"`);
+    log(`[Auth Step 1.2] Title: "${currentTitle}"`);
 
-    // Проверка WAF / Client Challenge
     let retries = 0;
     while (retries < 8) {
       if (!currentTitle.includes('403') && !currentTitle.includes('404') && !currentTitle.includes('Client Challenge')) {
         break;
       }
-      log(`[Auth Challenge] Ожидание смены задерживающего экрана WAF (попытка ${retries + 1}, Title: "${currentTitle}")...`);
+      log(`[Auth Challenge] Ожидание WAF (попытка ${retries + 1}, Title: "${currentTitle}")...`);
       await new Promise(r => setTimeout(r, 2000));
       currentTitle = await page.title();
       retries++;
     }
 
     if (currentTitle.includes('403') || currentTitle.includes('404')) {
-      throw new Error(`Сайт заблокировал запрос через прокси (Title: "${currentTitle}")`);
+      throw new Error(`Сайт заблокировал IP прокси (Title: "${currentTitle}")`);
     }
 
-    log(`[Auth Step 2] Ожидание селектора input[name="login"]...`);
+    log(`[Auth Step 2] Ожидание инпута login...`);
     await page.waitForSelector('input[name="login"]', { timeout: 20000 });
-    log(`[Auth Step 2.1] Инпут логина найден`);
 
-    log(`[Auth Step 3] Ввод логина и пароля...`);
+    log(`[Auth Step 3] Ввод учетных данных...`);
     await page.type('input[name="login"]', login, { delay: 20 });
     await page.type('input[name="passw"]', password, { delay: 20 });
 
-    log(`[Auth Step 4] Отправка формы и ожидание навигации...`);
+    log(`[Auth Step 4] Отправка формы...`);
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => log(`[Nav Warning] ${e.message}`)),
       page.keyboard.press('Enter')
     ]);
 
-    log(`[Auth Step 4.1] Ожидание установки сессионных куки (2 сек)...`);
     await new Promise(r => setTimeout(r, 2000));
 
     const finalUrl = page.url();
     const finalTitle = await page.title();
-    log(`[Auth Step 5] Финальный URL: ${finalUrl} | Title: "${finalTitle}"`);
+    log(`[Auth Step 5] URL: ${finalUrl} | Title: "${finalTitle}"`);
 
     log(`[Auth Step 6] Чтение куки...`);
     const rawCookies = await page.cookies();
@@ -183,12 +172,12 @@ async function performPuppeteerAuth(domain, login, password) {
     const cookieString = rawCookies.map(c => `${c.name}=${c.value}`).join('; ');
     const ussidVal = cookiesObj['ussid'];
 
-    log(`[Auth Step 6.1] Получено кук: ${rawCookies.length}. Значение ussid: "${ussidVal || 'НЕ ПОЛУЧЕН'}"`);
+    log(`[Auth Step 6.1] Кук: ${rawCookies.length}. ussid: "${ussidVal || 'НЕ ПОЛУЧЕН'}"`);
 
     const isSuccess = Boolean(ussidVal && ussidVal !== 'deleted');
 
     await browser.close();
-    log(`[Auth Finish] Браузер закрыт. Статус авторизации: ${isSuccess ? 'УСПЕХ' : 'ОШИБКА'}`);
+    log(`[Auth Finish] Завершено. Статус: ${isSuccess ? 'УСПЕХ' : 'ОШИБКА'}`);
 
     if (!isSuccess) {
       throw new Error(`Авторизация не удалась (ussid=${ussidVal || 'null'}). Title: "${finalTitle}"`);
@@ -206,7 +195,6 @@ async function performPuppeteerAuth(domain, login, password) {
     log(`[Auth Exception] Ошибка: ${err.message}`);
     if (browser) {
       await browser.close().catch(() => {});
-      log(`[Auth Exception] Браузер принудительно закрыт`);
     }
     return {
       success: false,
@@ -216,9 +204,6 @@ async function performPuppeteerAuth(domain, login, password) {
   }
 }
 
-/**
- * Функция взаимодействия с корзиной через SOCKS5
- */
 async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
   const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
@@ -282,10 +267,6 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
     return null;
   }
 }
-
-// ---------------------------------------------------------------------
-// МАРШРУТЫ И ЭНДПОИНТЫ API
-// ---------------------------------------------------------------------
 
 app.get('/', (req, res) => {
   res.send('Auth & Basket Service is Live');
