@@ -23,6 +23,9 @@ function parseKef(value) {
   return parseFloat(value) || 0;
 }
 
+/**
+ * Быстрая проверка валидности кук в кэше
+ */
 async function isSessionValid(domain, cookieString) {
   if (!cookieString || !cookieString.includes('ussid=')) {
     return false;
@@ -51,7 +54,7 @@ async function isSessionValid(domain, cookieString) {
 }
 
 /**
- * Подробная авторизация с расширенным логированием
+ * Исправленная авторизация с прохождением Client Challenge
  */
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
@@ -88,14 +91,23 @@ async function performPuppeteerAuth(domain, login, password) {
     await page.setViewport({ width: 1366, height: 768 });
 
     log(`[Auth Step 1] Переход на ${targetUrl}`);
-    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 45000 });
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-    const initialTitle = await page.title();
-    log(`[Auth Step 1] Заголовок страницы: "${initialTitle}"`);
+    // Проверяем, не попали ли на Client Challenge
+    let currentTitle = await page.title();
+    log(`[Auth Step 1] Заголовок страницы: "${currentTitle}"`);
 
-    // Поиск формы логина
+    if (currentTitle.includes('Client Challenge') || currentTitle.includes('Just a moment')) {
+      log(`[Auth Challenge] Обнаружен защитный челлендж. Ожидаем прохождения JS...`);
+      // Даем времени фронтенд-скриптам решить челлендж
+      await new Promise(r => setTimeout(r, 6000));
+      currentTitle = await page.title();
+      log(`[Auth Challenge] Заголовок после ожидания: "${currentTitle}"`);
+    }
+
+    // Ожидаем инпут логина
     log(`[Auth Step 2] Ожидание инпута login...`);
-    const loginInput = await page.waitForSelector('input[name="login"]', { timeout: 20000 }).catch(() => null);
+    const loginInput = await page.waitForSelector('input[name="login"]', { timeout: 25000 }).catch(() => null);
 
     if (!loginInput) {
       const pageSnippet = (await page.content()).substring(0, 500);
@@ -103,14 +115,28 @@ async function performPuppeteerAuth(domain, login, password) {
       throw new Error('Инпут login не найден на странице');
     }
 
-    log(`[Auth Step 3] Ввод учетных данных...`);
-    await page.type('input[name="login"]', login, { delay: 40 });
-    await page.type('input[name="passw"]', password, { delay: 40 });
+    log(`[Auth Step 3] Ввод логина и пароля...`);
+    await page.type('input[name="login"]', login, { delay: 30 });
+    await page.type('input[name="passw"]', password, { delay: 30 });
 
-    log(`[Auth Step 4] Отправка формы по нажатию Enter...`);
+    log(`[Auth Step 4] Отправка формы авторизации через JS...`);
+    
+    // Выполняем сабмит формы прямо из страницы с захватом скрытых полей asid и psid
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(e => log(`[Auth Nav Warning] ${e.message}`)),
-      page.keyboard.press('Enter')
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => log(`[Auth Nav Warning] ${e.message}`)),
+      page.evaluate(() => {
+        const loginInp = document.querySelector('input[name="login"]');
+        if (loginInp) {
+          const form = loginInp.closest('form');
+          if (form) {
+            form.submit();
+            return;
+          }
+        }
+        // Запасной способ — клик по кнопке
+        const enterBtn = document.querySelector('.enterBtn, .enterLinkBtn');
+        if (enterBtn) enterBtn.click();
+      })
     ]);
 
     await new Promise(r => setTimeout(r, 4000));
@@ -127,15 +153,15 @@ async function performPuppeteerAuth(domain, login, password) {
     const cookieString = rawCookies.map(c => `${c.name}=${c.value}`).join('; ');
     const ussidVal = cookiesObj['ussid'];
 
-    log(`[Auth Step 6] Полученные куки ключи: ${Object.keys(cookiesObj).join(', ')}`);
-    log(`[Auth Step 6] Значение ussid: "${ussidVal}"`);
+    log(`[Auth Step 6] Получено кук: ${Object.keys(cookiesObj).length}`);
+    log(`[Auth Step 6] ussid: "${ussidVal || 'НЕ ПОЛУЧЕН'}"`);
 
     const isSuccess = Boolean(ussidVal && ussidVal !== 'deleted');
 
     await browser.close();
 
     if (!isSuccess) {
-      throw new Error(`Авторизация не удалась (ussid=${ussidVal || 'null'}). Итоговый title: "${finalTitle}"`);
+      throw new Error(`Авторизация не удалась (ussid=${ussidVal || 'null'}). Title: "${finalTitle}"`);
     }
 
     return {
@@ -156,6 +182,9 @@ async function performPuppeteerAuth(domain, login, password) {
   }
 }
 
+/**
+ * Функция работы с корзиной
+ */
 async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
   const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
@@ -197,9 +226,7 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
     const response = await axios.post(addUrl, payload, { headers });
     const betslip = response.data?.betslip;
 
-    if (!betslip) {
-      return null;
-    }
+    if (!betslip) return null;
 
     const keys = Object.keys(betslip);
     if (keys.length === 0) return null;
