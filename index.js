@@ -8,11 +8,9 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 
-// Поддержка JSON и URL-encoded данных
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// In-Memory кэш сессий
 const sessionCache = {};
 
 function parseKef(value) {
@@ -25,12 +23,20 @@ function parseKef(value) {
   return parseFloat(value) || 0;
 }
 
+/**
+ * Быстрая проверка валидности кук в кэше
+ */
 async function isSessionValid(domain, cookieString) {
+  if (!cookieString || !cookieString.includes('ussid=')) {
+    return false;
+  }
+
   try {
-    const response = await axios.get(`https://${domain}/`, {
+    const response = await axios.get(`https://${domain}/ajax_basket_index.php?_r=${Math.random()}`, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
-        'Cookie': cookieString
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Cookie': cookieString,
+        'X-Requested-With': 'XMLHttpRequest'
       },
       maxRedirects: 0,
       timeout: 5000,
@@ -38,17 +44,30 @@ async function isSessionValid(domain, cookieString) {
     });
 
     const setCookie = response.headers['set-cookie'] || [];
-    return !setCookie.some(header => header.includes('ussid=deleted'));
+    const isDeleted = setCookie.some(header => header.includes('ussid=deleted'));
+
+    if (isDeleted) return false;
+    return Boolean(response.data && typeof response.data === 'object');
   } catch (err) {
     return false;
   }
 }
 
+/**
+ * Функция авторизации с полноценным прохождением WAF Client Challenge
+ */
 async function performPuppeteerAuth(domain, login, password) {
   let browser = null;
   const targetUrl = `https://${domain}/`;
+  const debugLogs = [];
+
+  const log = (msg) => {
+    console.log(msg);
+    debugLogs.push(msg);
+  };
 
   try {
+    log(`[Auth Start] Запуск авторизации для домена: ${domain}`);
     const executablePath = await chromium.executablePath();
 
     browser = await puppeteer.launch({
@@ -58,10 +77,10 @@ async function performPuppeteerAuth(domain, login, password) {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--single-process'
+        '--disable-blink-features=AutomationControlled', // Маскировка автоматизации
+        '--window-size=1366,768'
       ],
-      defaultViewport: chromium.defaultViewport,
+      defaultViewport: { width: 1366, height: 768 },
       executablePath: executablePath,
       headless: chromium.headless,
       ignoreHTTPSErrors: true,
@@ -69,56 +88,97 @@ async function performPuppeteerAuth(domain, login, password) {
 
     const page = await browser.newPage();
 
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const resourceType = req.resourceType();
-      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
-        req.abort();
-      } else {
-        req.continue();
-      }
+    // Задаем реальный User-Agent и заголовки Chrome
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
     });
 
-    await page.setViewport({ width: 1366, height: 768 });
+    // ВАЖНО: НЕ блокируем никакие ресурсы (RequestInterception отключен)!
+    // Скриптам Client Challenge нужны стили, шрифты и фоновые JS-файлы.
 
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForSelector('input[name="login"]', { timeout: 15000 });
+    log(`[Auth Step 1] Переход на ${targetUrl}`);
+    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
-    await page.type('input[name="login"]', login, { delay: 20 });
-    await page.type('input[name="passw"]', password, { delay: 20 });
+    // Ждем, пока title изменится и перестанет быть "Client Challenge"
+    let retries = 0;
+    while (retries < 10) {
+      const currentTitle = await page.title();
+      log(`[Auth Step 1.1] Текущий Title (попытка ${retries + 1}): "${currentTitle}"`);
+      
+      if (!currentTitle.includes('Client Challenge') && !currentTitle.includes('Just a moment')) {
+        break; // Успешно прошли челлендж
+      }
+      
+      await new Promise(r => setTimeout(r, 2000));
+      retries++;
+    }
 
+    // Дополнительная проверка: если заголовок все еще Client Challenge
+    const titleAfterWait = await page.title();
+    if (titleAfterWait.includes('Client Challenge')) {
+      const snippet = (await page.content()).substring(0, 400);
+      log(`[Auth Error] Челлендж WAF не пройден. HTML:\n${snippet}`);
+      throw new Error('Защита WAF (Client Challenge) не пропустила запрос');
+    }
+
+    log(`[Auth Step 2] Ожидание инпута login...`);
+    await page.waitForSelector('input[name="login"]', { timeout: 20000 });
+
+    log(`[Auth Step 3] Ввод данных авторизации...`);
+    await page.type('input[name="login"]', login, { delay: 50 });
+    await page.type('input[name="passw"]', password, { delay: 50 });
+
+    log(`[Auth Step 4] Отправка формы...`);
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(e => log(`[Nav Warn] ${e.message}`)),
       page.keyboard.press('Enter')
     ]);
 
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 3000));
+
+    const finalUrl = page.url();
+    const finalTitle = await page.title();
+    log(`[Auth Step 5] Итоговый URL: ${finalUrl}`);
+    log(`[Auth Step 5] Итоговый Title: "${finalTitle}"`);
 
     const rawCookies = await page.cookies();
     const cookiesObj = {};
     rawCookies.forEach(c => { cookiesObj[c.name] = c.value; });
 
     const cookieString = rawCookies.map(c => `${c.name}=${c.value}`).join('; ');
-    const isSuccess = Boolean(cookiesObj['ussid'] && cookiesObj['ussid'] !== 'deleted');
+    const ussidVal = cookiesObj['ussid'];
+
+    log(`[Auth Step 6] ussid: "${ussidVal || 'НЕ ПОЛУЧЕН'}"`);
+
+    const isSuccess = Boolean(ussidVal && ussidVal !== 'deleted');
 
     await browser.close();
 
-    if (!isSuccess) throw new Error('Авторизация не удалась (ussid не получен)');
+    if (!isSuccess) {
+      throw new Error(`Авторизация не удалась (ussid=${ussidVal || 'null'})`);
+    }
 
     return {
       success: true,
-      ussid: cookiesObj['ussid'],
+      ussid: ussidVal,
       cookies: cookiesObj,
-      cookie_string: cookieString
+      cookie_string: cookieString,
+      logs: debugLogs
     };
+
   } catch (err) {
     if (browser) await browser.close();
-    throw err;
+    return {
+      success: false,
+      error: err.message,
+      logs: debugLogs
+    };
   }
 }
 
 /**
- * Функция добавления исхода в корзину (с точным сбором параметров)
+ * Функция работы с корзиной
  */
 async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
@@ -127,13 +187,11 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
   const originalId = String(outcome.originalId || '').trim();
   const basketId = String(outcome.basketId || '').trim();
 
-  // 1. Формируем точный составной ID: originalId + ":" + basketId + ":140612801"
   let fullId = `${originalId}:${basketId}`;
   if (!fullId.endsWith(':140612801')) {
     fullId += ':140612801';
   }
 
-  // 2. Достаем параметр match (первое число из basketId, например "86173165")
   const matchParam = basketId.split(':')[0] || matchId;
 
   const headers = {
@@ -143,39 +201,31 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
     'cookie': cookieString,
     'origin': `https://${domain}`,
     'referer': `https://${domain}/betting/index.php?page=line&action=2`,
-    'sec-ch-ua': '"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"',
+    'sec-ch-ua': '"Not:A-Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'x-requested-with': 'XMLHttpRequest'
   };
 
   try {
-    // Шаг 1. Очищаем корзину
     await axios.post(clearUrl, 'action=clearbasket&currpage=line', { headers }).catch(() => {});
 
-    // Шаг 2. Собираем payload с обязательным кодированием id
     const encodedId = encodeURIComponent(fullId);
     const prob = outcome.probability;
     const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${prob}&id=${encodedId}&v1=${prob}&v2=1&v3=1&match=${matchParam}`;
 
-    console.log(`[Basket Req] Payload: ${payload}`);
-
     const response = await axios.post(addUrl, payload, { headers });
     const betslip = response.data?.betslip;
 
-    if (!betslip) {
-      console.log(`[Basket Fail] Поле betslip не получено. Ответ: ${JSON.stringify(response.data)}`);
-      return null;
-    }
+    if (!betslip) return null;
 
     const keys = Object.keys(betslip);
     if (keys.length === 0) return null;
 
-    // Возвращаем первую добавленную ставку
     return betslip[keys[0]];
   } catch (e) {
     console.log(`[Basket Exception] ${e.message}`);
@@ -184,15 +234,13 @@ async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
 }
 
 // ---------------------------------------------------------------------
-// МАРШРУТЫ И ЭНДПОИНТЫ API
+// МАРШРУТЫ API
 // ---------------------------------------------------------------------
 
-// Главная страница
 app.get('/', (req, res) => {
   res.send('Auth & Basket Service is Live');
 });
 
-// Единый обработчик для /auth (поддерживает GET и POST)
 const handleAuth = async (req, res) => {
   const login = req.query?.login || req.body?.login;
   const password = req.query?.password || req.body?.password;
@@ -222,8 +270,17 @@ const handleAuth = async (req, res) => {
 
     const authResult = await performPuppeteerAuth(domain, login, password);
 
+    if (!authResult.success) {
+      return res.status(500).json({
+        success: false,
+        domain: domain,
+        error: authResult.error,
+        debug_logs: authResult.logs
+      });
+    }
+
     sessionCache[cacheKey] = {
-      success: authResult.success,
+      success: true,
       ussid: authResult.ussid,
       cookies: authResult.cookies,
       cookie_string: authResult.cookie_string,
@@ -233,7 +290,8 @@ const handleAuth = async (req, res) => {
     return res.json({
       from_cache: false,
       domain: domain,
-      ...sessionCache[cacheKey]
+      ...sessionCache[cacheKey],
+      debug_logs: authResult.logs
     });
 
   } catch (err) {
@@ -248,80 +306,6 @@ const handleAuth = async (req, res) => {
 app.get('/auth', handleAuth);
 app.post('/auth', handleAuth);
 
-// Обработчик /getmaxinfo (поддерживает GET и POST)
-/**
- * Функция отправки исхода в корзину (соответствует структурам curl)
- */
-async function fetchBetFromBasket(domain, cookieString, outcome, matchId) {
-  const clearUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
-  const addUrl = `https://${domain}/ajax_basket_index.php?_r=${Math.random()}`;
-
-  // 1. Формирование корректного ID для добавления в корзину
-  let rawBasketId = String(outcome.basketId || '');
-  let originalId = String(outcome.originalId || '');
-
-  let fullId = '';
-  if (rawBasketId.startsWith(originalId)) {
-    fullId = rawBasketId;
-  } else {
-    fullId = `${originalId}:${rawBasketId}`;
-  }
-
-  // Если в ID меньше 9 элементов через двоеточие, добавляем хвост
-  if ((fullId.match(/:/g) || []).length < 9) {
-    fullId += ':140612801';
-  }
-
-  // Извлекаем matchId для корзины (86173165)
-  const parts = rawBasketId.split(':');
-  const matchParam = parts.length > 1 ? parts[0] : (parts[0] || matchId);
-
-  const headers = {
-    'accept': 'application/json, text/javascript, */*; q=0.01',
-    'accept-language': 'ru,en-US;q=0.9,en;q=0.8',
-    'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
-    'cookie': cookieString,
-    'origin': `https://${domain}`,
-    'referer': `https://${domain}/betting/index.php?page=line&action=2`,
-    'sec-ch-ua': '"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest': 'empty',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-site': 'same-origin',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
-    'x-requested-with': 'XMLHttpRequest'
-  };
-
-  try {
-    // 1. Очищаем корзину
-    await axios.post(clearUrl, 'action=clearbasket&currpage=line', { headers }).catch(() => {});
-
-    // 2. Добавляем исход
-    const payload = `action=addkef&typenav=1&TypeBet=1&currpage=line&text=${outcome.probability}&id=${encodeURIComponent(fullId)}&v1=${outcome.probability}&v2=1&v3=1&match=${matchParam}`;
-
-    const response = await axios.post(addUrl, payload, { headers });
-    const betslip = response.data?.betslip;
-
-    if (!betslip) {
-      console.log('[Basket Fail] Пустой betslip:', JSON.stringify(response.data));
-      return null;
-    }
-
-    const keys = Object.keys(betslip);
-    if (keys.length === 0) return null;
-
-    // Возвращаем объект добавленного исхода
-    return betslip[keys[0]];
-  } catch (e) {
-    console.log(`[Basket Exception] ${e.message}`);
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------
-// ОБРАБОТЧИК /getmaxinfo
-// ---------------------------------------------------------------------
 const handleGetMaxInfo = async (req, res) => {
   const login = req.query?.login || req.body?.login || '77088167661';
   const password = req.query?.password || req.body?.password || 'Almaty2026';
@@ -339,11 +323,18 @@ const handleGetMaxInfo = async (req, res) => {
 
   try {
     let session = sessionCache[cacheKey];
+    
     if (!session || !(await isSessionValid(domain, session.cookie_string))) {
-      console.log('[Auth] Запуск авторизации Puppeteer...');
       const authResult = await performPuppeteerAuth(domain, login, password);
+      if (!authResult.success) {
+        return res.json({
+          success: false,
+          error: `Ошибка авторизации: ${authResult.error}`,
+          logs: authResult.logs
+        });
+      }
       sessionCache[cacheKey] = {
-        success: authResult.success,
+        success: true,
         ussid: authResult.ussid,
         cookies: authResult.cookies,
         cookie_string: authResult.cookie_string,
@@ -354,7 +345,6 @@ const handleGetMaxInfo = async (req, res) => {
 
     const cookieString = session.cookie_string;
 
-    // Последовательно запрашиваем корзину для обох исходов
     const betjson1 = await fetchBetFromBasket(domain, cookieString, outcomes[0], matchId);
     const betjson2 = await fetchBetFromBasket(domain, cookieString, outcomes[1], matchId);
 
@@ -410,7 +400,6 @@ const handleGetMaxInfo = async (req, res) => {
 app.get('/getmaxinfo', handleGetMaxInfo);
 app.post('/getmaxinfo', handleGetMaxInfo);
 
-// Обработчик несуществующих маршрутов
 app.use((req, res) => {
   res.status(404).json({ error: `Route ${req.method} ${req.url} not found` });
 });
