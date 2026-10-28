@@ -102,20 +102,40 @@ async function performPuppeteerAuth(domain, login, password) {
     let currentTitle = await page.title();
     log(`[Auth Step 1.2] Title: "${currentTitle}"`);
 
+    // --- ОБРАБОТКА WAF / CLIENT CHALLENGE ---
+    let retries = 0;
+    while (retries < 10) {
+      if (!currentTitle.includes('403') && 
+          !currentTitle.includes('404') && 
+          !currentTitle.includes('Client Challenge') && 
+          !currentTitle.includes('Just a moment')) {
+        break;
+      }
+      log(`[Auth Challenge] Ожидание смены задерживающего экрана WAF (попытка ${retries + 1}, Title: "${currentTitle}")...`);
+      await new Promise(r => setTimeout(r, 2000));
+      currentTitle = await page.title();
+      retries++;
+    }
+
+    if (currentTitle.includes('403') || currentTitle.includes('404')) {
+      throw new Error(`Сайт заблокировал IP прокси (Title: "${currentTitle}")`);
+    }
+
     log(`[Auth Step 2] Ожидание инпута login...`);
-    await page.waitForSelector('input[name="login"]', { timeout: 20000 });
+    await page.waitForSelector('input[name="login"]', { timeout: 25000 });
+    log(`[Auth Step 2.1] Инпут логина найден!`);
 
     log(`[Auth Step 3] Ввод учетных данных...`);
-    await page.type('input[name="login"]', login, { delay: 20 });
-    await page.type('input[name="passw"]', password, { delay: 20 });
+    await page.type('input[name="login"]', login, { delay: 30 });
+    await page.type('input[name="passw"]', password, { delay: 30 });
 
     log(`[Auth Step 4] Отправка формы...`);
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => log(`[Nav Warning] ${e.message}`)),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 35000 }).catch(e => log(`[Nav Warning] ${e.message}`)),
       page.keyboard.press('Enter')
     ]);
 
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 3000));
 
     const finalUrl = page.url();
     const finalTitle = await page.title();
